@@ -1,11 +1,16 @@
 use std::{
-    io, net::ToSocketAddrs, sync::{
+    fs::{
+        self, File
+    }, io::{
+        self, 
+        Read, 
+        Write
+    }, net::ToSocketAddrs, path::Path, sync::{
         mpsc::{self, Receiver, Sender}, Arc, Mutex
     }, thread::{self, JoinHandle}, time::{
         Duration, Instant, SystemTime, UNIX_EPOCH
     }
 };
-
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Constraint, Layout}, prelude::{
@@ -16,6 +21,10 @@ use ratatui::{
         Block, Paragraph, Widget
     }, DefaultTerminal, Frame
 };
+use serde::{Deserialize, Serialize};
+use serde_json::{to_string_pretty, Value};
+
+const CONFIG_PATH: &str = "./config.json";
 
 #[derive(Clone, Debug, Default)]
 pub struct Server {
@@ -35,6 +44,11 @@ pub struct App {
     exit: bool,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+pub struct Config {
+    servers: Vec<String>
+}
+
 impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal, sender: Sender<Vec<Server>>) -> io::Result<()> {
         while !self.exit {
@@ -43,6 +57,14 @@ impl App {
             self.event_handler()?;
            
         }
+        // save config
+        let config = Config {
+            servers: self.servers.iter().map(|s| s.hostname.clone()).collect()
+        };
+        let json = to_string_pretty(&config)?;
+        let mut file = File::create(CONFIG_PATH)?;
+        file.write(json.as_bytes()).expect("Failed to write to file.");
+
         Ok(())
     }
 
@@ -304,9 +326,28 @@ fn ping(domain: String) -> Option<u128> {
 }
 
 fn main () -> io::Result<()> {
-    let servers = vec![
-        Server { hostname: "bitfeller.uk".to_string()}; 1
-    ];
+    let config = match Path::new(CONFIG_PATH).exists() {
+        true => {
+            let file = fs::read_to_string(CONFIG_PATH)?;
+            if let Ok(cfg) = serde_json::from_str(&file) {
+                cfg
+            } else {
+                Config::default()
+            }
+        },
+        false => {
+            let mut file = File::create(CONFIG_PATH)?;
+            file.write_all(b"{}")?;
+            Config::default()
+        }
+    };
+
+    let servers: Vec<Server> = config.servers
+        .into_iter()
+        .map(|s| Server {hostname: s})
+        .collect();
+
+
     let ping_times_raw: Vec<Option<u128>> = vec![Some(100); servers.len()];
     let ping_times = Arc::new(Mutex::new(ping_times_raw));
     let thread_ping_times = Arc::clone(&ping_times);
