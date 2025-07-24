@@ -426,7 +426,7 @@ impl Widget for &mut App {
                     .block(block)
                     .render(vertical[1], buf);
 
-            }, // todo
+            },
             Screen::Status => status_text(vec![" Stuff is happening... ", " Please wait "]),
             Screen::Message => status_text(vec![" Stuff has happened ", " Press Enter to continue "]),
         }      
