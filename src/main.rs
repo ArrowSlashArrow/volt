@@ -1,18 +1,21 @@
 use std::{
-    fs::{
+    clone, collections::HashMap, fs::{
         self, File
     }, io::{
         self, 
         Write
     }, net::ToSocketAddrs, path::Path, sync::{
         mpsc::{self, Receiver, Sender}, Arc, Mutex
-    }, thread::{self, JoinHandle}, time::{
+    }, thread::{self, sleep_ms, JoinHandle}, time::{
         Duration, Instant, SystemTime, UNIX_EPOCH
     }
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::{SplitSink, SplitStream}, SinkExt, StreamExt};
+use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async, tungstenite::{client::IntoClientRequest, Message}
+    connect_async, tungstenite::{
+        client::IntoClientRequest, Message, http::Response, Error
+    }, MaybeTlsStream, WebSocketStream
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -25,8 +28,9 @@ use ratatui::{
         Block, Paragraph, Widget
     }, DefaultTerminal, Frame
 };
+use sha2::{self, Sha256, Digest};
 use serde::{Deserialize, Serialize};
-use serde_json::{to_string_pretty};
+use serde_json::{to_string, to_string_pretty, Value};
 
 const CONFIG_PATH: &str = "./config.json";
 const PORT: u16 = 2096;
@@ -43,12 +47,39 @@ enum Screen {
     Connected,
     New,
     Status,
-    Message // status but waits for user to press enter before continuing
+    Message, // status but waits for user to press enter before continuing
+    Login
+}
+#[derive(PartialEq)]
+enum LoginField {
+    Username,
+    Password
+}
+
+#[derive(Default, Clone)]
+struct Login {
+    username: String,
+    password: String,
 }
 
 impl Default for Screen {
     fn default() -> Self {
         Screen::Selection
+    }
+}
+
+pub struct ConnectedSocket {
+    write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>
+}
+
+impl ConnectedSocket {
+    pub async fn send(&mut self, data: String) {
+        self.write.send(data.into()).await;
+    }
+
+    pub async fn read(&mut self) -> Option<Result<Message, Error>> {
+        self.read.next().await
     }
 }
 
@@ -64,12 +95,31 @@ pub struct App {
     exit: bool,
     status_text: String,
     terminal: Option<DefaultTerminal>,
-    next_fn: Option<Box<dyn Fn(&mut Self)>>
+    next_fn: Option<Box<dyn Fn(&mut Self)>>,
+    connected_socket: Option<ConnectedSocket>,
+    selected_login_field: LoginField,
+    login: Login,
+    session: String
 }
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
     servers: Vec<String>
+}
+
+fn go_to_selection() -> Box<dyn Fn(&mut App)>{
+    return Box::new(|app: &mut App| {app.go_to_selection()})
+}
+
+fn nop() -> Box<dyn Fn(&mut App)> {
+    return Box::new(|_| {})
+}
+
+fn payload<T: Into<String>>(action: T, data: HashMap<String, Value>) -> String {
+    let action_str = action.into();
+    let mut cloned = data.clone();
+    cloned.insert("action".to_string(), Value::String(action_str));
+    return to_string(&cloned).unwrap();
 }
 
 impl App {
@@ -130,6 +180,8 @@ impl App {
     }
 
     pub fn go_to_selection(&mut self) {
+        self.connected_socket = None;
+        self.login = Default::default();
         self.screen = Screen::Selection;
     }
 
@@ -137,25 +189,65 @@ impl App {
         // todo: make a WSS for tls (and e2ee eventually)
         let url = format!("ws://{}:{PORT}", self.servers[self.selected_server].hostname).into_client_request().unwrap();
         self.status("Connecting...");
-        let res = connect_async(url).await;
+        let res: Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response<Option<Vec<u8>>>), Error> = connect_async(url).await;
         match res {
             Ok((ws_stream, response)) => {
-                self.message(
-                    format!("Connected to the server. ({})", response.status()),
-                    Box::new(|a| {a.go_to_selection()})
+                // ws_stream is a WebSocketStream<MaybeTlsStream<TcpStream>>
+                self.status(
+                    format!("Connected to the server. ({})", response.status())
                 );
+                // SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>
+                // SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>
                 let (mut write, mut read) = ws_stream.split();
 
-                write.send(Message::Text("hello from me.".into())).await.unwrap()
-
+                let _ = write.send(payload("session", HashMap::new()).into()).await;
+                if let Some(msg) = read.next().await {
+                    match msg {
+                        Ok(v) => {
+                            self.connected_socket = Some(ConnectedSocket { write: write, read: read });
+                            let raw = v.into_text().unwrap().to_string();
+                            let json: Value = serde_json::from_str(&raw).unwrap();
+                            self.session = json["session"].to_string();
+                            self.screen = Screen::Login;
+                        },
+                        Err(_) => {
+                            self.message("Unable to get session.", go_to_selection());
+                        }
+                    }
+                };
             },
             Err(e) => {
                 self.message(
                     format!("Failed to connect to server\n{e}"),
-                    Box::new(|a| {a.go_to_selection()})
+                    go_to_selection()
                 )
             }
         }  
+    }
+
+    pub async fn handle_login(&mut self, socket: &mut ConnectedSocket) {
+        if let Some(msg) = socket.read().await {
+            match msg {
+                Ok(v) => {
+                    let json: Value = serde_json::from_str(&v.into_text().unwrap().to_string()).unwrap();
+                    match json["success"].as_bool().unwrap() {
+                        true => {
+                            self.status("Logged in successfully. [TODO] Loading clientside...")
+                        },
+                        false => self.message(format!("Login failed: {}", json["reason"]), go_to_selection())
+                    }
+                }
+                Err(_) => {
+                    self.message("Failed to log in.", go_to_selection())
+                }
+            }
+        }
+    }
+
+    pub fn session_template(&mut self) -> HashMap<String, Value> {
+        let mut template: HashMap<String, Value> = HashMap::new();
+        template.insert("session".to_string(), Value::String(self.session.clone()));
+        return template
     }
 
     pub async fn selection_keybinds(&mut self, key_event: KeyEvent) {
@@ -202,7 +294,7 @@ impl App {
             KeyCode::Char('n') => {
                 self.new_server(false);
             }
-            KeyCode::Char('q') => {
+            KeyCode::Esc => {
                 self.exit = true;
             },
             _ => {}
@@ -211,7 +303,7 @@ impl App {
 
     pub fn connected_keybinds(&mut self, key_event: KeyEvent) {
         match key_event.code {
-            KeyCode::Char('q') => {
+            KeyCode::Esc => {
                 self.exit = true;
             },
             _ => {}
@@ -257,7 +349,7 @@ impl App {
 
     pub fn status_keybinds(&mut self, key_event: KeyEvent) {
         match key_event.code {
-            KeyCode::Char('q') => {
+            KeyCode::Esc => {
                 self.exit = true;
             },
             _ => {}
@@ -266,13 +358,63 @@ impl App {
 
     pub fn message_keybinds(&mut self, key_event: KeyEvent) {
         match key_event.code {
-            KeyCode::Char('q') => {
+            KeyCode::Esc => {
                 self.exit = true;
             },
             KeyCode::Enter => {
                 if let Some(next_fn) = self.next_fn.take() {
                     next_fn(self)
                 }
+            }
+            _ => {}
+        }
+    }
+
+    pub async fn login_keybinds (&mut self, key_event: KeyEvent) { 
+        match key_event.code {
+            KeyCode::Enter => {
+                match self.selected_login_field {
+                    LoginField::Username => self.selected_login_field = LoginField::Password,
+                    LoginField::Password => { // login
+                        let mut data = self.session_template();
+                        data.insert("session".into(), self.session.clone().into());
+                        data.insert("username".into(), self.login.username.clone().into());
+                        data.insert(
+                            "password".into(), 
+                            Sha256::digest(self.login.password.clone())[..].into()
+                        );
+
+                        if let Some(socket) = self.connected_socket.as_mut() {
+                            socket.send(payload("login", data)).await;
+                        };
+                        self.status("Logging in...");
+                        if let Some(mut socket) = self.connected_socket.take() {
+                            self.handle_login(&mut socket).await;
+                            self.connected_socket = Some(socket);
+                        }
+                    }
+                }
+            },
+            KeyCode::Tab => {
+                self.selected_login_field = match self.selected_login_field {
+                    LoginField::Username => LoginField::Password,
+                    LoginField::Password => LoginField::Username
+                }
+            },
+            KeyCode::Esc => {
+                self.go_to_selection();
+            }
+            KeyCode::Char(char) => {
+                match self.selected_login_field {
+                    LoginField::Password => self.login.password.push(char),
+                    LoginField::Username => self.login.username.push(char)
+                }
+            },
+            KeyCode::Backspace => {
+                match self.selected_login_field {
+                    LoginField::Password => self.login.password.pop(),
+                    LoginField::Username => self.login.username.pop()
+                };
             }
             _ => {}
         }
@@ -286,7 +428,8 @@ impl App {
                     Screen::Connected => self.connected_keybinds(key_event),
                     Screen::New => self.new_keybinds(key_event),
                     Screen::Status => self.status_keybinds(key_event),
-                    Screen::Message => self.message_keybinds(key_event)
+                    Screen::Message => self.message_keybinds(key_event),
+                    Screen::Login => self.login_keybinds(key_event).await
                 };
             }
         }
@@ -394,18 +537,24 @@ impl Widget for &mut App {
             },
             Screen::Connected => {
 
-            }, // todo
+            },
             Screen::New => { 
                 let keybinds = Line::from(vec![
                     " Confirm ".bold(), "<Enter>  ".cyan().bold(),
                     "Cancel ".bold(), "<Esc>  ".cyan().bold()
                 ]);
 
+                let center = Layout::horizontal(vec![
+                    Constraint::Min(1),
+                    Constraint::Length(90),
+                    Constraint::Min(1),
+                ]).split(area);
+
                 let vertical = Layout::vertical(vec![
                     Constraint::Min(1),
                     Constraint::Length(3),
                     Constraint::Min(1)
-                ]).split(area);
+                ]).split(center[1]);
 
                 let block = Block::bordered()
                     .border_set(border::DOUBLE)
@@ -429,6 +578,77 @@ impl Widget for &mut App {
             },
             Screen::Status => status_text(vec![" Stuff is happening... ", " Please wait "]),
             Screen::Message => status_text(vec![" Stuff has happened ", " Press Enter to continue "]),
+            Screen::Login => {
+                let keybinds = match self.selected_login_field {
+                    LoginField::Password => {
+                        Line::from(vec![
+                            " Log in ".bold(), "<Enter>  ".cyan().bold(),
+                            "Cancel ".bold(), "<Esc> ".cyan().bold()
+                        ])
+                    },
+                    LoginField::Username => {
+                        Line::from(vec![
+                            " Go to password field ".bold(), "<Enter>  ".cyan().bold(),
+                            "Cancel ".bold(), "<Esc> ".cyan().bold()
+                        ])
+                    }
+                };
+                
+                let center = Layout::horizontal(vec![
+                    Constraint::Min(1),
+                    Constraint::Length(90),
+                    Constraint::Min(1),
+                ]).split(area);
+
+                let vertical = Layout::vertical(vec![
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Length(3),
+                    Constraint::Min(1)
+                ]).split(center[1]);
+
+                let focused = &self.selected_login_field;
+
+                let username = vec![
+                    " ".into(), 
+                    self.login.username.clone().into(), 
+                    if SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() % 1000 < 500 
+                        && *focused == LoginField::Username {
+                        "_".cyan()
+                    } else {
+                        "".into()
+                    }
+                ];
+
+                let password = vec![
+                    " ".into(), 
+                    self.login.password.clone().chars().map(|_| "*").collect::<String>().into(), 
+                    if SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() % 1000 < 500 
+                        && *focused == LoginField::Password {
+                        "_".cyan()
+                    } else {
+                        "".into()
+                    }
+                ];
+                
+                Paragraph::new(Line::from("Enter login credentials. Accounts that do not exist are automatically created.").centered())
+                    .render(vertical[1], buf);
+
+                Paragraph::new(Line::from(username))
+                    .block(Block::bordered()
+                        .border_set(border::DOUBLE)
+                        .title(Line::from(" Username ")))
+                    .render(vertical[2], buf);
+
+                Paragraph::new(Line::from(password))
+                    .block(Block::bordered()
+                        .border_set(border::DOUBLE)
+                        .title(Line::from(" Password "))
+                        .title_bottom(keybinds.right_aligned()))
+                    .render(vertical[4], buf);
+            }
         }      
     }
 }
@@ -492,6 +712,10 @@ async fn main () -> io::Result<()> {
         status_text: Default::default(),
         next_fn: Some(Box::new(app_next_fn_placeholder)),
         terminal: Some(terminal),
+        connected_socket: Default::default(),
+        selected_login_field: LoginField::Username,
+        login: Default::default(),
+        session: Default::default()
     };
     app.servers = servers;
     app.ping_times = ping_times;
