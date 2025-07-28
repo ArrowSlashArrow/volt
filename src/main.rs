@@ -11,6 +11,7 @@ use std::{
     }
 };
 use futures_util::{stream::{SplitSink, SplitStream}, SinkExt, StreamExt};
+use futures::future::join_all;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     connect_async, tungstenite::{
@@ -88,6 +89,7 @@ pub struct CurrentServer {
     msgs: HashMap<String, Vec<Msg>>
 }
 
+#[derive(Debug)]
 pub struct FetcherInfo {
     ping_times: Vec<Option<u128>>
 }
@@ -956,7 +958,6 @@ fn dbg_write<T: Debug>(val: T) {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64 / 1000.0,
         type_name::<T>()
     );
-
     let _ = fs::write("debug", format!("{prev}{new}"));
 }
 
@@ -1374,19 +1375,14 @@ impl Widget for &mut App {
     }
 }
 
-fn ping(domain: String) -> Option<u128> {
-    let addr = format!("{domain}:{PORT}");
+async fn ping(domain: String) -> Option<u128> {
+    let addr = format!("ws://{domain}:{PORT}");
     let start = Instant::now();
 
-    if let Ok(mut addrs) = addr.to_socket_addrs() {
-        if let Some(socket) = addrs.next() {
-            if std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(1)).is_ok() {
-                return Some(start.elapsed().as_millis())
-            }
-        }
-    };
-
-    None
+    return match connect_async(&addr).await {
+        Ok((_, _)) => Some(start.elapsed().as_millis()),
+        Err(e) => None
+    }
 }
 
 #[tokio::main]
@@ -1466,33 +1462,34 @@ async fn main () {
     // channel stuff
     let (ping_sender, ping_receiver): (Sender<PartialAppState>, Receiver<PartialAppState>) = mpsc::channel();
 
-    thread::spawn(move || {
+    tokio::spawn(async move {
         let mut hosts: Vec<Server> = vec![];
         let mut screen: Screen = Screen::Selection;
+        // get the latencies of each server           
+        let mut ping_results = vec![];
         loop {
+            
             // get new data
             while let Ok(state) = ping_receiver.try_recv() {
                 hosts = state.servers;
                 screen = state.screen;
             }
 
-            // get the latencies of each server           
-            let mut ping_results = vec![];
+            
             match screen {
                 Screen::Selection => {
                     let ping_threads = hosts.clone()
                         .into_iter()
                         .map(|host| {
-                            thread::spawn( move || {
-                                ping(host.hostname)
+                            tokio::spawn(async move {
+                                ping(host.hostname).await
                             })
                         })
-                        .collect::<Vec<JoinHandle<Option<u128>>>>();
+                        .collect::<Vec<tokio::task::JoinHandle<Option<u128>>>>();
 
-                    ping_results = ping_threads
-                        .into_iter()
-                        .map(|handle| handle.join().unwrap())
-                        .collect::<Vec<Option<u128>>>();
+                    ping_results = join_all(ping_threads).await.into_iter().map(
+                        |future| future.unwrap()
+                    ).collect();
                 }
                 _ => {}
             };
@@ -1500,7 +1497,7 @@ async fn main () {
             {
                 let mut info = thread_fetcher_info.lock().unwrap();
                 *info = FetcherInfo {
-                    ping_times: ping_results
+                    ping_times: ping_results.clone()
                 }
                 // todo: ping the server (and maek the backend)
             }
@@ -1513,3 +1510,6 @@ async fn main () {
     ratatui::restore(); 
     std::process::exit(0);
 }
+
+// yes, this is a 1500 line rust file.
+// what can i say? the vscode scope collapser is really nice.
