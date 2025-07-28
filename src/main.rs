@@ -4,7 +4,7 @@ use std::{
     }, io::{
         self, 
         Write
-    }, net::ToSocketAddrs, path::Path, process, sync::{
+    }, net::ToSocketAddrs, path::Path, sync::{
         mpsc::{self, Receiver, Sender}, Arc, Mutex
     }, thread::{self, JoinHandle}, time::{
         Duration, Instant, SystemTime, UNIX_EPOCH
@@ -18,9 +18,9 @@ use tokio_tungstenite::{
     }, MaybeTlsStream, WebSocketStream
 };
 
-use crossterm::{event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers}};
+use crossterm::{event::{self, Event, KeyCode, KeyEvent, KeyEventKind}};
 use ratatui::{
-    crossterm::terminal::disable_raw_mode, layout::{Constraint, Layout}, prelude::{
+    layout::{Constraint, Layout}, prelude::{
         Buffer, Rect
     }, style::{Color, Stylize}, symbols::border, text::{
         Line, Span, Text
@@ -28,12 +28,13 @@ use ratatui::{
         Block, Paragraph, Widget
     }, DefaultTerminal, Frame
 };
-use sha2::{self, digest::crypto_common::Key, Digest, Sha256};
+use sha2::{self, Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::{to_string, to_string_pretty, Value, from_value};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 use chrono::prelude::*;
 use copypasta::{ClipboardContext, ClipboardProvider};
+use unicode_segmentation::UnicodeSegmentation;
 
 const CONFIG_PATH: &str = "./config.json";
 const PORT: u16 = 2096;
@@ -44,7 +45,7 @@ pub struct Server {
     hostname: String
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Screen {
     Selection,
     Connected,
@@ -71,34 +72,29 @@ impl Default for Screen {
     }
 }
 
-pub struct ConnectedSocket {
-    write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>
-}
-
-impl ConnectedSocket {
-    pub async fn send(&mut self, data: String) {
-        let _ = self.write.send(data.into()).await;
-    }
-
-    pub async fn read(&mut self) -> Option<Result<Message, Error>> {
-        self.read.next().await
-    }
-}
-
 #[derive(Default, Debug, Clone)]
 pub struct Msg {
     msg: String,
     id: u64,
     user: String,
-    time: u32,
+    time: u64,
     replying_to: Option<u64>
 }
 
 #[derive(Default)]
 pub struct CurrentServer {
+    hostname: String,
     channels: Vec<String>,
     msgs: HashMap<String, Vec<Msg>>
+}
+
+pub struct FetcherInfo {
+    ping_times: Vec<Option<u128>>
+}
+
+pub struct PartialAppState {
+    servers: Vec<Server>,
+    screen: Screen
 }
 
 pub struct App {
@@ -107,14 +103,15 @@ pub struct App {
     selected_server: usize,
     server_selection_scroll_size: u16,
     scroll_offset: i32,
-    ping_times: Arc<Mutex<Vec<Option<u128>>>>,
+    fetcher_info: Arc<Mutex<FetcherInfo>>,
     editing_server: Server, // the server that is in the new connection screen
     editing_existing_index: Option<usize>,
     exit: bool,
     status_text: String,
     terminal: Option<DefaultTerminal>,
     next_fn: Option<Box<dyn Fn(&mut Self)>>,
-    connected_socket: Option<ConnectedSocket>,
+    connected_socket_read: Option<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    connected_socket_write: Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
     selected_login_field: LoginField,
     login: Login,
     session: String,
@@ -125,8 +122,11 @@ pub struct App {
     private: EphemeralSecret,
     public: PublicKey,
     clipboard: Box<dyn ClipboardProvider>,
-    new_message_buf: String,
+    new_message_bufs: HashMap<String, String>,
     sidebar: bool,
+    msg_receiver: tokio::sync::mpsc::Receiver<Result<Message, Error>>,
+    msg_sender: tokio::sync::mpsc::Sender<Result<Message, Error>>,
+    ws_reader_thread: Option<tokio::task::JoinHandle<()>>,
     selected_channel: Option<usize>,
     selected_msg_ids: HashMap<String, Option<u64>>,
     selected_msg_idcs: HashMap<String, Option<usize>> // index in the corresponding messages vec
@@ -164,26 +164,43 @@ fn generate_keys() -> (EphemeralSecret, PublicKey) {
 
 // converts dict to msg object
 fn unpack_msg(raw_msg: &HashMap<String, String>) -> Msg {
+    let get = |s: &str| {
+        raw_msg.get(s).unwrap().chars().filter(|c| *c != '"').collect::<String>()
+    };
     return Msg { 
-        msg: raw_msg.get("msg").unwrap().clone(), 
-        id: raw_msg.get("time").unwrap().parse::<u64>().unwrap(),  // use time as id
-        user: raw_msg.get("user").unwrap().clone(), 
-        time: (raw_msg.get("time").unwrap().parse::<u64>().unwrap() / 1000) as u32,
-        replying_to: match raw_msg.get("replying_to").unwrap().parse::<u64>() {
+        msg: get("msg"), 
+        id: get("time").parse::<u64>().unwrap(),  // use time as id
+        user: get("user"), 
+        time: get("time").parse::<u64>().unwrap() / 1000,
+        replying_to: match get("replying_to").parse::<u64>() {
             Ok(v) => Some(v),
             Err(_) => None
         } 
     }
 }
 
+fn pack_msg(msg: Msg) -> String {
+    return format!(
+        "{{\"user\": \"{}\", \"time\": \"{}\", \"msg\": \"{}\", \"replying_to\": \"{}\"}}",
+        msg.user,
+        msg.time,
+        msg.msg,
+        match msg.replying_to {Some(v) => v as i128, None => -1i128}
+    );
+}
+/*
 
+ */
 impl App {
-    pub async fn run(&mut self, sender: Sender<Vec<Server>>) -> io::Result<()> {
+    pub async fn run(&mut self, info_sender: Sender<PartialAppState>) -> io::Result<()> {
         while !self.exit {
-            let _ = sender.send(self.servers.clone());
+            let _ = info_sender.send(PartialAppState {
+                servers: self.servers.clone(),
+                screen: self.screen.clone(),
+            });
             self.redraw();
             let _ = self.event_handler().await;
-           
+            
         }
         // save config
         let config = Config {
@@ -235,7 +252,8 @@ impl App {
     }
 
     pub fn go_to_selection(&mut self) {
-        self.connected_socket = None;
+        self.connected_socket_read = None;
+        self.connected_socket_write = None;
         self.selected_login_field = LoginField::Username;
         self.login = Default::default();
         self.screen = Screen::Selection;
@@ -254,8 +272,6 @@ impl App {
         let res: Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response<Option<Vec<u8>>>), Error> = connect_async(url).await;
         match res {
             Ok((ws_stream, response)) => {
-                // ws_stream is a WebSocketStream<MaybeTlsStream<TcpStream>>
-                
                 let (mut write, mut read) = ws_stream.split();
 
                 if let Some(msg) = read.next().await {
@@ -283,7 +299,8 @@ impl App {
                 if let Some(msg) = read.next().await {
                     match msg {
                         Ok(v) => {
-                            self.connected_socket = Some(ConnectedSocket { write: write, read: read });
+                            self.connected_socket_read = Some(read);
+                            self.connected_socket_write = Some(write);
                             let raw = v.into_text().unwrap().to_string();
                             let json: Value = serde_json::from_str(&raw).unwrap();
                             self.session = json["session"].as_str().unwrap().to_string();
@@ -301,33 +318,44 @@ impl App {
                     go_to_selection()
                 )
             }
-        }  
+        };
     }
 
-    pub async fn handle_login(&mut self, socket: &mut ConnectedSocket) {
-        if let Some(msg) = socket.read().await {
+    pub async fn handle_login(&mut self) {
+        let mut write = self.connected_socket_write.take();
+        let mut read = self.connected_socket_read.take();
+        if let Some(msg) = read.as_mut().unwrap().next().await {
             match msg {
-                Ok(v) => {
-                    let json: Value = serde_json::from_str(&v.into_text().unwrap().to_string()).unwrap();
-                    match json["success"].as_bool().unwrap() {
-                        true => {
-                            self.status("Logged in successfully. Fetching server data...");
-                        },
-                        false => {
-                            let reason = json["reason"].as_str().unwrap();
-                            self.message(format!("Login failed: {reason}"), retry_login());
-                            return;
+                Ok(v) => match v {
+                    Message::Text(text) => {
+                        let json: Value = serde_json::from_str(&text.to_string()).unwrap();
+                        match json["success"].as_bool().unwrap() {
+                            true => {
+                                self.status("Logged in successfully. Fetching server data...");
+                            },
+                            false => {
+                                let reason = json["reason"].as_str().unwrap();
+                                self.message(format!("Login failed: {reason}"), retry_login());
+                                self.connected_socket_read = read;
+                                self.connected_socket_write = write;
+                                return;
+                            }
                         }
-                    }
+                    },
+                    _ => {}
                 }
+                
                 Err(_) => self.message("Failed to log in.", go_to_selection())
             }
         }
 
         self.screen = Screen::Connected;
         // fetch data
-        socket.send(payload("data", self.session_template())).await;
-        if let Some(raw) = socket.read().await {
+        
+        if let Err(_) = write.as_mut().unwrap().send(payload("data", self.session_template()).into()).await {
+            self.message("Connection timed out", go_to_selection());
+        };
+        if let Some(raw) = read.as_mut().unwrap().next().await {
             match raw {
                 Ok(data) => {
                     self.selected_msg_idcs = HashMap::new();
@@ -335,21 +363,28 @@ impl App {
                     let json: Value = serde_json::from_str(data.to_string().as_str()).unwrap();
                     let mut msgs: HashMap<String, Vec<Msg>> = HashMap::new();
                     let channels: Vec<String> = from_value(json["channels"].clone()).unwrap();
-                    let raw_msg_lists: HashMap<String, Vec<HashMap<String, String>>> = from_value(json["msgs"].clone()).unwrap();
+                    let raw_msg_lists: HashMap<String, Vec<String>> = from_value(json["msgs"].clone()).unwrap();
                     for channel in channels.iter() {
                         msgs.insert(
                             channel.clone(),
                             raw_msg_lists.get(channel).unwrap().iter()
-                                .map(|msg| {unpack_msg(msg)}).collect()
+                                .map(|msg| {
+                                    let dict: Value = serde_json::from_str(msg.as_str()).unwrap();
+                                    let parsed = dict.as_object().unwrap().iter().map(|(k, v)| {
+                                        (k.clone(), v.to_string())
+                                    }).collect::<HashMap<String, String>>();
+                                    unpack_msg(&parsed)
+                                }).collect()
                         );
                         self.selected_msg_idcs.insert(channel.clone(), None);
                         self.selected_msg_ids.insert(channel.clone(), None);
+                        self.new_message_bufs.insert(channel.clone(), "".to_string());
                     } 
  
                     if channels.len() > 0 {
                         self.selected_channel = Some(0);
                     }
-                    self.current_server = CurrentServer {channels: channels, msgs}
+                    self.current_server = CurrentServer {hostname: format!("{}", self.servers[self.selected_server].hostname), channels, msgs};
                 },
                 Err(_) => {
                     self.message("Failed to fetch server data", go_to_selection());
@@ -357,6 +392,20 @@ impl App {
                 }
             }
         };
+
+        // put it back
+        self.connected_socket_write = write;
+
+        let sender = self.msg_sender.clone();
+
+        // put it back and reread into thread var
+        self.connected_socket_read = read;
+        let mut thread_read = self.connected_socket_read.take().unwrap();
+        self.ws_reader_thread = Some(tokio::spawn(async move {
+            while let Some(msg) = thread_read.next().await {
+                let _ = sender.send(msg).await;
+            }
+        }));
     }
 
     pub fn session_template(&mut self) -> HashMap<String, Value> {
@@ -416,8 +465,18 @@ impl App {
         }
     }
 
+    pub async fn disconnect(&mut self) {
+        let mut socket = self.connected_socket_write.take().unwrap();
+        let _ = socket.send(Message::Close(None)).await;
+        self.connected_socket_write = None;
+        self.ws_reader_thread.as_mut().unwrap().abort();
+        self.ws_reader_thread = None;
+        self.go_to_selection();
+    } 
+
     pub async fn connected_keybinds(&mut self, key_event: KeyEvent) {
         let mut selected_channel: Option<String> = None;
+        let channel_name = self.current_server.channels[self.selected_channel.unwrap()].clone();
 
         if let Some(idx) = self.selected_channel {
             selected_channel = Some(self.current_server.channels[idx].clone());
@@ -465,24 +524,28 @@ impl App {
             match key_event.code {
                 KeyCode::Esc => self.typing = false,
                 KeyCode::Char(c) => {
-                    self.new_message_buf.push(c)
+                    if let Some(buf) = self.new_message_bufs.get_mut(&channel_name) {
+                        buf.push(c);
+                    }
                 },
                 KeyCode::Backspace => {
-                    self.new_message_buf.pop();
+                    if let Some(buf) = self.new_message_bufs.get_mut(&channel_name) {
+                        buf.pop();
+                    }
                 },
                 KeyCode::PageUp => {
-                    if let Some(idx) = self.selected_channel {
-                        if idx > 0 {
-                            self.selected_channel = Some(idx - 1);
+                    if let Some(idx) = self.selected_channel.as_mut() {
+                        if *idx > 0usize {
+                            *idx -= 1usize;
                         }
                     }
                 },
                 KeyCode::PageDown => {
                     let length = self.current_server.channels.len();
-                    match self.selected_channel {
+                    match self.selected_channel.as_mut() {
                         Some(idx) => {
-                            if idx < length - 1 {
-                                self.selected_channel = Some(idx)
+                            if *idx < length - 1 {
+                                *idx += 1usize
                             }
                         },
                         None => {
@@ -493,40 +556,51 @@ impl App {
                     }
                 },
                 KeyCode::Enter => {
-                    if let Some(channel) = self.selected_channel {
-                        // send the msg
+                    if let Some(_) = self.selected_channel {
+                        let sending = Msg {
+                            user: self.current_user.clone(),
+                            msg: self.new_message_bufs.get(&channel_name).unwrap().clone(),
+                            id: 0,
+                            time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                            replying_to: self.replying_to
+                        };
+
+                        let mut data = self.session_template();
+                        data.insert("msg".to_string(), Value::from(pack_msg(sending)));
+                        data.insert("channel".to_string(), Value::from(channel_name.clone()));
+
+                        if let Some(ws) = self.connected_socket_write.as_mut() {
+                            ws.send(payload("message", data).into()).await.unwrap()
+                        }
+
+                        if let Some(msg) = self.new_message_bufs.get_mut(&channel_name) {
+                            *msg = String::new();
+                        }
                     }
                 },
                 KeyCode::Up => prev_msg( self),
                 KeyCode::Down => next_msg( self),
-                KeyCode::Char('v') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // todo: paste
-                }
                 _ => {}
             }
         } else {
             match key_event.code {
                 KeyCode::Up => prev_msg(self),
                 KeyCode::Down => next_msg(self),
-                KeyCode::Esc => {
-                    let mut socket = self.connected_socket.take().unwrap();
-                    let _ = socket.write.send(Message::Close(None)).await;
-                    self.go_to_selection();
-                },
+                KeyCode::Esc => self.disconnect().await,
                 KeyCode::Tab => self.typing = true,
                 KeyCode::PageUp => {
-                    if let Some(idx) = self.selected_channel {
-                        if idx > 0 {
-                            self.selected_channel = Some(idx - 1);
+                    if let Some(idx) = self.selected_channel.as_mut() {
+                        if *idx > 0usize {
+                            *idx -= 1usize;
                         }
                     }
                 },
                 KeyCode::PageDown => {
                     let length = self.current_server.channels.len();
-                    match self.selected_channel {
+                    match self.selected_channel.as_mut() {
                         Some(idx) => {
-                            if idx < length - 1 {
-                                self.selected_channel = Some(idx)
+                            if *idx < length - 1 {
+                                *idx += 1usize
                             }
                         },
                         None => {
@@ -604,15 +678,15 @@ impl App {
                     Some(index) => {
                         servers[index] = self.editing_server.clone();
                         {
-                            let mut pings = self.ping_times.lock().unwrap();
-                            pings[index] = None;
+                            let mut data = self.fetcher_info.lock().unwrap();
+                            data.ping_times[index] = None;
                         }
                     },
                     None => {
                         servers.push(self.editing_server.clone());
                         {
-                            let mut pings = self.ping_times.lock().unwrap();
-                            pings.push(None);
+                            let mut data = self.fetcher_info.lock().unwrap();
+                            data.ping_times.push(None);
                         }
                     }
                 }
@@ -652,6 +726,21 @@ impl App {
     }
 
     pub async fn login_keybinds (&mut self, key_event: KeyEvent) { 
+        if let Ok(msg) = self.msg_receiver.try_recv() {
+            match msg {
+                Ok(msg) => match msg {
+                    Message::Close(_) => {
+                        self.message("The websocket has closed.", go_to_selection());
+                        self.disconnect().await;
+                    }
+                    _ => {}
+                },           
+                Err(e) => match e {
+                    Error::ConnectionClosed => self.message("The websocket has kicked you out.", go_to_selection()),
+                    _ => {}
+                }
+            }
+        };
         match key_event.code {
             KeyCode::Enter => {
                 match self.selected_login_field {
@@ -664,13 +753,14 @@ impl App {
                             Sha256::digest(self.login.password.clone())[..].into()
                         );
 
-                        if let Some(socket) = self.connected_socket.as_mut() {
-                            socket.send(payload("login", data)).await;
+                        if let Some(socket) = self.connected_socket_write.as_mut() {
+                            let _ = socket.send(payload("login", data).into()).await;
                         };
                         self.status("Logging in...");
-                        if let Some(mut socket) = self.connected_socket.take() {
-                            self.handle_login(&mut socket).await;
-                            self.connected_socket = Some(socket);
+                        if let (Some(read), Some(write)) = (self.connected_socket_read.take(), self.connected_socket_write.take()) {
+                            self.connected_socket_write = Some(write);
+                            self.connected_socket_read = Some(read);
+                            self.handle_login().await;
                             self.current_user = self.login.username.clone();
                         }
                     }
@@ -701,6 +791,53 @@ impl App {
         }
     }
 
+    pub async fn handle_ws_message(&mut self, message: Result<Message, Error>) {
+        match message {
+            Ok(msg) => match msg {
+                Message::Binary(m) => {
+                    let json_str = String::from_utf8(base64::decode(m).unwrap()).unwrap();
+
+                    let mut new_msg: HashMap<String, String> = HashMap::new();
+                    match serde_json::from_str::<Value>(&json_str) {
+                        Ok(data) => {
+                            new_msg = data.as_object().unwrap().iter().map(|(k, v)| {
+                                let mut trimmed_v = v.to_string()[1..].to_string();
+                                trimmed_v.pop();
+                                (k.clone(), trimmed_v)
+                            }).collect();
+                        },
+                        Err(_) => return
+                    }
+                    
+                    match new_msg.get("what").unwrap_or(&"".to_string()).as_str() {
+                        "new_msg" => {
+                            let channel = new_msg.get("channel").unwrap();
+                            let raw_msg = new_msg.get("msg").unwrap().chars().filter(|c| *c != '\\').collect::<String>();
+                            let msg_dict: HashMap<String, Value> = serde_json::from_str(&raw_msg).unwrap();
+                            let msg = unpack_msg(
+                                &msg_dict.iter().map(|(k, v)| (k.clone(), v.to_string())).collect()
+                            );
+
+                            if let Some(channel) = self.current_server.msgs.get_mut(channel) {
+                                channel.push(msg)
+                            };                       
+                        },
+                        _ => {}
+                    }
+                },
+                Message::Close(_) => {
+                    self.message("The websocket has closed.", go_to_selection());
+                    self.disconnect().await;
+                }
+                _ => {}
+            },           
+            Err(e) => match e {
+                Error::ConnectionClosed => self.message("The websocket has kicked you out.", go_to_selection()),
+                _ => {}
+            }
+        }
+    }   
+
     pub async fn event_handler(&mut self) -> io::Result<()> {
         if event::poll(Duration::from_millis(0))? {
             if let Event::Key(key_event) = event::read()? && key_event.kind == KeyEventKind::Press {
@@ -713,12 +850,20 @@ impl App {
                     Screen::Login     => self.login_keybinds(key_event).await
                 };
             }
+        };
+        match self.screen {
+            Screen::Connected => {
+                if let Ok(msg) = self.msg_receiver.try_recv() {
+                    self.handle_ws_message(msg).await;
+                }
+            },
+            _ => {}
         }
         Ok(())
     }
 }
 
-fn timestamp_str(timestamp: u32) -> String {
+fn timestamp_str(timestamp: u64) -> String {
     let datetime = DateTime::from_timestamp(timestamp as i64, 0);
     let timestamp_str = format!("{}", datetime.unwrap().with_timezone(&chrono::Local));
     match timestamp_str.rfind(" ") {
@@ -742,35 +887,48 @@ fn render_msg(msg: &Msg, channel: &Vec<Msg>, width: u16, selected_id: &Option<u6
         let reply = channel.iter().find(|msg| msg.id == reply_id);
         header_vec.push(match reply {
             Some(reply) => {
-                used_chars += 18 + reply.user.len();
+                used_chars += 19 + reply.user.len();
                 let space_left = width as usize - used_chars;
                 let mut reply_content = reply.msg.clone();
                 if reply_content.len() >= space_left {
                     reply_content.truncate(space_left - 1);
                     reply_content.push('…')
                 }
-                format!("[ \u{f17ab} {}: {}] ", reply.user, reply_content).into()
+                format!(" [ \u{f17ab} {}: {}] ", reply.user, reply_content).into()
             },
-            None => "[ \u{f17ab} ???] ".into()
+            None => " [ \u{f17ab} ???] ".into()
         });
     }
 
     let header = Line::from(header_vec);
     let mut msg_lines = vec![header];
+
+    let array = msg.msg.split(' ').collect::<Vec<&str>>();
+    
+    let mut split_up: Vec<String> = vec![];
+    for word in array {
+        let mut new_val: Vec<String> = UnicodeSegmentation::graphemes(word, true)
+            .collect::<Vec<_>>()
+            .chunks(max_text_length)
+            .map(|chunk| chunk.concat())
+            .collect();
+        split_up.append(&mut new_val);
+    }
     
     let mut current_line = "".to_string();
     let mut current_width = 0usize;
     // greedy word wrapper
-    for word in msg.msg.split(' ').collect::<Vec<&str>>() {
+    for word in split_up {
         let word_width = word.chars().count();
 
         if current_width + word_width + current_line.is_empty() as usize <= max_text_length {
             if !current_line.is_empty() {
                 current_line.push(' ');
             }
-            current_line += word
+            current_line += &word;
+            current_width += word_width;
         } else {
-            if current_line.len() >= max_text_length {
+            if current_line.len() > max_text_length {
                 current_line.truncate(max_text_length - 1);
                 current_line.push('…')
             }
@@ -794,7 +952,7 @@ fn render_msg(msg: &Msg, channel: &Vec<Msg>, width: u16, selected_id: &Option<u6
 fn dbg_write<T: Debug>(val: T) {
     let prev = fs::read_to_string("debug").unwrap();
     let new = format!(
-        "[{:.3}] {val:?}: {}\n", 
+        "[{:.3}] {val:#?}: {}\n", 
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64 / 1000.0,
         type_name::<T>()
     );
@@ -806,8 +964,8 @@ impl Widget for &mut App {
     // here is the drawing logic
     fn render(self, area: Rect, buf: &mut Buffer) {
         let ping_times = {
-            let readonly = self.ping_times.lock().unwrap();
-            readonly.clone()
+            let readonly = self.fetcher_info.lock().unwrap();
+            readonly.ping_times.clone()
         };
         let servers =  &self.servers;
         let mut status_text = |texts: Vec<&str>| {
@@ -922,20 +1080,22 @@ impl Widget for &mut App {
                     false => area
                 });
 
-                let width = message_area[1].width as usize - 4;
-                let buf_length = self.new_message_buf.len();
+                let width = message_area[1].width as usize - 8;
+
+                let channel_name = self.current_server.channels[self.selected_channel.unwrap()].clone();
+                let buf_length = self.new_message_bufs.get(&channel_name).unwrap().len();
                 let visible = match buf_length > width {
-                    true => self.new_message_buf[(buf_length - width)..].to_string(),
-                    false => self.new_message_buf.clone()
+                    true => self.new_message_bufs[&channel_name][(buf_length - width)..].to_string(),
+                    false => self.new_message_bufs[&channel_name].clone()
                 };
 
-                let new_message_line = match self.new_message_buf.is_empty() {
+                let new_message_line = match self.new_message_bufs[&channel_name].is_empty() {
                     true => vec![
-                        " ".into(), 
+                        Span::from("  >  ").dark_gray(), 
                         match self.typing {true => "N".to_string().gray().on_cyan(), false => "N".to_string().dark_gray()}, 
                         "ew Message...".to_string().dark_gray()],
                     false => vec![
-                        " ".into(), 
+                        Span::from("  >  ").dark_gray(), 
                         visible.into(), 
                         match self.typing {true => " ", false => ""}.to_string().on_cyan()
                     ],
@@ -1051,7 +1211,10 @@ impl Widget for &mut App {
 
                 Paragraph::new(Text::from(visible_msgs))
                     .block(Block::bordered()
-                        .border_set(border::DOUBLE))
+                        .border_set(border::DOUBLE)
+                        .title(Line::from(format!(
+                            " {} #{} ", self.current_server.hostname, selected_channel.clone().unwrap()
+                        )).centered()))
                     .scroll((scroll_offset as u16, 0))
                     .render(message_area[0], buf);
 
@@ -1072,7 +1235,7 @@ impl Widget for &mut App {
                 let mut msg_block = Block::bordered()
                     .border_set(border::DOUBLE)
                     .title(Line::from(" ".to_owned() + &timestamp_str(
-                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32
+                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u64
                     ) + " ").right_aligned());
 
                 if let Some(reply_id) = self.replying_to {
@@ -1227,10 +1390,10 @@ fn ping(domain: String) -> Option<u128> {
 }
 
 #[tokio::main]
-async fn main () -> io::Result<()> {
+async fn main () {
     let config = match Path::new(CONFIG_PATH).exists() {
         true => {
-            let file = fs::read_to_string(CONFIG_PATH)?;
+            let file = fs::read_to_string(CONFIG_PATH).unwrap();
             if let Ok(cfg) = serde_json::from_str(&file) {
                 cfg
             } else {
@@ -1238,8 +1401,8 @@ async fn main () -> io::Result<()> {
             }
         },
         false => {
-            let mut file = File::create(CONFIG_PATH)?;
-            file.write_all(b"{}")?;
+            let mut file = File::create(CONFIG_PATH).unwrap();
+            let _ = file.write_all(b"{}");
             Config::default()
         }
     };
@@ -1251,11 +1414,17 @@ async fn main () -> io::Result<()> {
 
 
     let ping_times_raw: Vec<Option<u128>> = vec![None; servers.len()];
-    let ping_times = Arc::new(Mutex::new(ping_times_raw));
-    let thread_ping_times = Arc::clone(&ping_times);
+    let fetcher_info_raw = FetcherInfo {
+        ping_times: ping_times_raw,
+    };
+    let fetcher_info = Arc::new(Mutex::new(fetcher_info_raw));
+    let thread_fetcher_info = Arc::clone(&fetcher_info);
 
     let (private, public) = generate_keys();
-    
+
+    // socket reader
+    let (ws_sender, ws_receiver) = tokio::sync::mpsc::channel::<Result<Message, Error>>(100);
+
     let clipboard = ClipboardContext::new().unwrap();
     let terminal = ratatui::init();
     let mut app = App {
@@ -1264,7 +1433,7 @@ async fn main () -> io::Result<()> {
         selected_server: Default::default(),
         server_selection_scroll_size: Default::default(),
         scroll_offset: Default::default(),
-        ping_times: Default::default(),
+        fetcher_info: fetcher_info,
         editing_server: Default::default(),
         editing_existing_index: Default::default(),
         exit: Default::default(),
@@ -1272,7 +1441,8 @@ async fn main () -> io::Result<()> {
         next_fn: Some(nop()),
         terminal: Some(terminal),
         clipboard: Box::new(clipboard),
-        connected_socket: Default::default(),
+        connected_socket_read: Default::default(),
+        connected_socket_write: Default::default(),
         selected_login_field: LoginField::Username,
         login: Default::default(),
         session: Default::default(),
@@ -1282,46 +1452,56 @@ async fn main () -> io::Result<()> {
         current_user: String::new(),
         public: public,
         private: private,
-        new_message_buf: String::new(),
+        msg_receiver: ws_receiver,
+        msg_sender: ws_sender,
+        new_message_bufs: HashMap::new(),
+        ws_reader_thread: None,
         sidebar: true,
         selected_channel: None,
         selected_msg_ids: Default::default(),
         selected_msg_idcs: Default::default()
     };
     app.servers = servers;
-    app.ping_times = ping_times;
 
     // channel stuff
-
-    let (sender, receiver): (Sender<Vec<Server>>, Receiver<Vec<Server>>) = mpsc::channel();
+    let (ping_sender, ping_receiver): (Sender<PartialAppState>, Receiver<PartialAppState>) = mpsc::channel();
 
     thread::spawn(move || {
         let mut hosts: Vec<Server> = vec![];
+        let mut screen: Screen = Screen::Selection;
         loop {
             // get new data
-            while let Ok(servers) = receiver.try_recv() {
-                hosts = servers
+            while let Ok(state) = ping_receiver.try_recv() {
+                hosts = state.servers;
+                screen = state.screen;
             }
 
-            // get the latencies of each server
+            // get the latencies of each server           
+            let mut ping_results = vec![];
+            match screen {
+                Screen::Selection => {
+                    let ping_threads = hosts.clone()
+                        .into_iter()
+                        .map(|host| {
+                            thread::spawn( move || {
+                                ping(host.hostname)
+                            })
+                        })
+                        .collect::<Vec<JoinHandle<Option<u128>>>>();
 
-            let ping_threads = hosts.clone()
-                .into_iter()
-                .map(|host| {
-                    thread::spawn( move || {
-                        ping(host.hostname)
-                    })
-                })
-                .collect::<Vec<JoinHandle<Option<u128>>>>();
-
-            let ping_results = ping_threads
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<Option<u128>>>();
+                    ping_results = ping_threads
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .collect::<Vec<Option<u128>>>();
+                }
+                _ => {}
+            };
 
             {
-                let mut latencies = thread_ping_times.lock().unwrap();
-                *latencies = ping_results;
+                let mut info = thread_fetcher_info.lock().unwrap();
+                *info = FetcherInfo {
+                    ping_times: ping_results
+                }
                 // todo: ping the server (and maek the backend)
             }
 
@@ -1329,15 +1509,7 @@ async fn main () -> io::Result<()> {
         }
     });
 
-    // incase the app freezes
-    tokio::spawn(async {
-        tokio::signal::ctrl_c().await.unwrap();
-        disable_raw_mode().unwrap();
-        ratatui::restore();
-        process::exit(0);
-    });
-    
-    let app_result = app.run(sender).await;
+    let _ = app.run(ping_sender).await;
     ratatui::restore(); 
-    app_result
+    std::process::exit(0);
 }

@@ -60,6 +60,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1856,6 +1862,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "volt"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "copypasta",
  "crossterm 0.29.0",
@@ -1869,6 +1876,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-tungstenite",
+ "unicode-segmentation",
  "url",
  "x25519-dalek",
 ]
