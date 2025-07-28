@@ -1,12 +1,11 @@
 use std::{
     any::type_name, collections::HashMap, fmt::Debug, fs::{
-        self, File
+        self, File, OpenOptions
     }, io::{
-        self, 
-        Write
-    }, net::ToSocketAddrs, path::Path, sync::{
+        self, Write
+    }, path::Path, sync::{
         mpsc::{self, Receiver, Sender}, Arc, Mutex
-    }, thread::{self, JoinHandle}, time::{
+    }, thread::{self}, time::{
         Duration, Instant, SystemTime, UNIX_EPOCH
     }
 };
@@ -40,6 +39,7 @@ use unicode_segmentation::UnicodeSegmentation;
 const CONFIG_PATH: &str = "./config.json";
 const PORT: u16 = 2096;
 const DARK_GRAY: Color = Color::Rgb(60, 60, 60);
+const DEBUG_PATH: &str = "./debug.log";
 
 #[derive(Clone, Debug, Default)]
 pub struct Server {
@@ -63,8 +63,8 @@ enum LoginField {
 
 #[derive(Default, Clone)]
 struct Login {
-    username: String,
-    password: String,
+    username: InputBuffer,
+    password: InputBuffer,
 }
 
 impl Default for Screen {
@@ -99,6 +99,107 @@ pub struct PartialAppState {
     screen: Screen
 }
 
+#[derive(Default, Clone)]
+pub struct InputBuffer {
+    buf: String,
+    cursor_pos: usize
+}
+
+impl InputBuffer {
+    fn new() -> Self {
+        InputBuffer { buf: String::new(), cursor_pos: 0 }
+    }
+
+    fn from(s: String) -> Self {
+        InputBuffer { buf: s.clone(), cursor_pos: s.len() }
+    }
+
+    fn add(&mut self, ch: char) {
+        if self.cursor_pos < self.buf.len() {
+            self.buf.insert(self.cursor_pos, ch);
+        } else {
+            self.buf.push(ch);
+        }
+        self.cursor_pos += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor_pos > 0 {
+            if self.cursor_pos >= self.buf.len() - 1 {
+                self.buf.pop();
+            } else {
+                self.buf.remove(self.cursor_pos - 1);
+            }
+            self.cursor_pos -= 1;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor_pos < self.buf.len() {
+            if self.cursor_pos == self.buf.len() - 1 {
+                self.buf.pop();
+            } else {
+                self.buf.remove(self.cursor_pos);
+            }
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor_pos > 0 {
+            self.cursor_pos -= 1;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor_pos < self.buf.len() {
+            self.cursor_pos += 1;
+        }
+    }
+
+    fn draw(&self, focused: bool, placeholder: Option<String>, bufsize: u16) -> (Line, u16) {
+        let mut text: Vec<Span<'_>> = vec![" ".into()];
+
+        match self.buf.clone().chars().count() > 0 {
+            true => {
+                for char in self.buf.clone().chars() {
+                    text.push(Span::from(format!("{char}")));
+                }
+            },
+            false => {
+                let placehold = match placeholder {
+                    Some(v) => v,
+                    None => "".to_string()
+                };
+                for char in placehold.chars() {
+                    text.push(Span::from(format!("{char}")).dark_gray());
+                }
+            }
+        };
+        
+        text.push(" ".into());
+        if focused {
+            text[self.cursor_pos + 1] = text[self.cursor_pos + 1].clone().on_cyan().white();
+        }
+
+        let scroll_uncapped = std::cmp::max(self.cursor_pos as i32 - bufsize as i32 / 2 + 3, 1);
+        (Line::from(text.clone()), std::cmp::min(scroll_uncapped, 65536) as u16)
+        
+    }
+
+    fn draw_masked(&self, focused: bool) -> Line {
+        let mut text: Vec<Span<'_>> = vec![" ".into()];
+        for _ in self.buf.clone().chars() {
+            text.push(Span::from("*")); 
+        }
+
+        text.push(" ".into());
+        if focused {
+            text[self.cursor_pos + 1] = text[self.cursor_pos + 1].clone().on_cyan();
+        }
+        Line::from(text)
+    }
+}
+
 pub struct App {
     screen: Screen,
     servers: Vec<Server>,
@@ -106,7 +207,7 @@ pub struct App {
     server_selection_scroll_size: u16,
     scroll_offset: i32,
     fetcher_info: Arc<Mutex<FetcherInfo>>,
-    editing_server: Server, // the server that is in the new connection screen
+    editing_server: InputBuffer, // the server that is in the new connection screen
     editing_existing_index: Option<usize>,
     exit: bool,
     status_text: String,
@@ -124,7 +225,7 @@ pub struct App {
     private: EphemeralSecret,
     public: PublicKey,
     clipboard: Box<dyn ClipboardProvider>,
-    new_message_bufs: HashMap<String, String>,
+    new_message_bufs: HashMap<String, InputBuffer>,
     sidebar: bool,
     msg_receiver: tokio::sync::mpsc::Receiver<Result<Message, Error>>,
     msg_sender: tokio::sync::mpsc::Sender<Result<Message, Error>>,
@@ -223,11 +324,11 @@ impl App {
     pub fn new_server(&mut self, editing: bool) {
         match editing {
             true => {
-                self.editing_server = self.servers[self.selected_server].clone();
+                self.editing_server = InputBuffer::from(self.servers[self.selected_server].clone().hostname);
                 self.editing_existing_index = Some(self.selected_server)
             },
             false => {
-                self.editing_server = Server::default();
+                self.editing_server = InputBuffer::new();
                 self.editing_existing_index = None
             }
         };
@@ -352,11 +453,13 @@ impl App {
         }
 
         self.screen = Screen::Connected;
+
         // fetch data
-        
         if let Err(_) = write.as_mut().unwrap().send(payload("data", self.session_template()).into()).await {
             self.message("Connection timed out", go_to_selection());
         };
+
+        tokio::task::yield_now().await;
         if let Some(raw) = read.as_mut().unwrap().next().await {
             match raw {
                 Ok(data) => {
@@ -380,7 +483,7 @@ impl App {
                         );
                         self.selected_msg_idcs.insert(channel.clone(), None);
                         self.selected_msg_ids.insert(channel.clone(), None);
-                        self.new_message_bufs.insert(channel.clone(), "".to_string());
+                        self.new_message_bufs.insert(channel.clone(), InputBuffer::new());
                     } 
  
                     if channels.len() > 0 {
@@ -522,19 +625,15 @@ impl App {
             };
             app.typing = false;
         };
+        let buf = self.new_message_bufs.get_mut(&channel_name).unwrap();
         if self.typing {
             match key_event.code {
                 KeyCode::Esc => self.typing = false,
-                KeyCode::Char(c) => {
-                    if let Some(buf) = self.new_message_bufs.get_mut(&channel_name) {
-                        buf.push(c);
-                    }
-                },
-                KeyCode::Backspace => {
-                    if let Some(buf) = self.new_message_bufs.get_mut(&channel_name) {
-                        buf.pop();
-                    }
-                },
+                KeyCode::Char(c) => buf.add(c),
+                KeyCode::Backspace => buf.backspace(),
+                KeyCode::Delete => buf.delete(),
+                KeyCode::Left => buf.move_left(),
+                KeyCode::Right => buf.move_right(),
                 KeyCode::PageUp => {
                     if let Some(idx) = self.selected_channel.as_mut() {
                         if *idx > 0usize {
@@ -561,7 +660,7 @@ impl App {
                     if let Some(_) = self.selected_channel {
                         let sending = Msg {
                             user: self.current_user.clone(),
-                            msg: self.new_message_bufs.get(&channel_name).unwrap().clone(),
+                            msg: self.new_message_bufs.get(&channel_name).unwrap().buf.clone(),
                             id: 0,
                             time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
                             replying_to: self.replying_to
@@ -576,7 +675,7 @@ impl App {
                         }
 
                         if let Some(msg) = self.new_message_bufs.get_mut(&channel_name) {
-                            *msg = String::new();
+                            *msg = InputBuffer::new();
                         }
                     }
                 },
@@ -674,18 +773,18 @@ impl App {
                 self.screen = Screen::Selection;
             },
             KeyCode::Enter => {
-                let hostname = self.editing_server.hostname.trim();
-                self.editing_server.hostname = hostname.to_string();
+                let hostname = self.editing_server.buf.trim();
+                self.editing_server.buf = hostname.to_string();
                 match self.editing_existing_index {
                     Some(index) => {
-                        servers[index] = self.editing_server.clone();
+                        servers[index] = Server { hostname: self.editing_server.buf.clone() };
                         {
                             let mut data = self.fetcher_info.lock().unwrap();
                             data.ping_times[index] = None;
                         }
                     },
                     None => {
-                        servers.push(self.editing_server.clone());
+                        servers.push( Server { hostname: self.editing_server.buf.clone() } );
                         {
                             let mut data = self.fetcher_info.lock().unwrap();
                             data.ping_times.push(None);
@@ -694,12 +793,11 @@ impl App {
                 }
                 self.screen = Screen::Selection;
             },
-            KeyCode::Char(input) => {
-                self.editing_server.hostname.push(input);
-            },
-            KeyCode::Backspace => {
-                self.editing_server.hostname.pop();
-            }
+            KeyCode::Char(input) => self.editing_server.add(input),
+            KeyCode::Backspace => self.editing_server.backspace(),
+            KeyCode::Delete => self.editing_server.delete(),
+            KeyCode::Left => self.editing_server.move_left(),
+            KeyCode::Right => self.editing_server.move_right(),
             _ => {}
         }
     }
@@ -743,16 +841,20 @@ impl App {
                 }
             }
         };
+        let focused_field = match self.selected_login_field {
+            LoginField::Password => &mut self.login.password,
+            LoginField::Username => &mut self.login.username
+        };
         match key_event.code {
             KeyCode::Enter => {
                 match self.selected_login_field {
                     LoginField::Username => self.selected_login_field = LoginField::Password,
                     LoginField::Password => { // login
                         let mut data = self.session_template();
-                        data.insert("username".into(), self.login.username.clone().into());
+                        data.insert("username".into(), self.login.username.buf.clone().into());
                         data.insert(
                             "password".into(), 
-                            Sha256::digest(self.login.password.clone())[..].into()
+                            Sha256::digest(self.login.password.buf.clone())[..].into()
                         );
 
                         if let Some(socket) = self.connected_socket_write.as_mut() {
@@ -763,7 +865,7 @@ impl App {
                             self.connected_socket_write = Some(write);
                             self.connected_socket_read = Some(read);
                             self.handle_login().await;
-                            self.current_user = self.login.username.clone();
+                            self.current_user = self.login.username.buf.clone();
                         }
                     }
                 }
@@ -777,18 +879,11 @@ impl App {
             KeyCode::Esc => {
                 self.go_to_selection();
             }
-            KeyCode::Char(char) => {
-                match self.selected_login_field {
-                    LoginField::Password => self.login.password.push(char),
-                    LoginField::Username => self.login.username.push(char)
-                }
-            },
-            KeyCode::Backspace => {
-                match self.selected_login_field {
-                    LoginField::Password => self.login.password.pop(),
-                    LoginField::Username => self.login.username.pop()
-                };
-            }
+            KeyCode::Char(char) => focused_field.add(char),
+            KeyCode::Backspace => focused_field.backspace(),
+            KeyCode::Delete => focused_field.delete(),
+            KeyCode::Left => focused_field.move_left(),
+            KeyCode::Right => focused_field.move_right(),
             _ => {}
         }
     }
@@ -796,8 +891,8 @@ impl App {
     pub async fn handle_ws_message(&mut self, message: Result<Message, Error>) {
         match message {
             Ok(msg) => match msg {
-                Message::Binary(m) => {
-                    let json_str = String::from_utf8(base64::decode(m).unwrap()).unwrap();
+                Message::Text(m) => {
+                    let json_str = m.to_string();
 
                     let mut new_msg: HashMap<String, String> = HashMap::new();
                     match serde_json::from_str::<Value>(&json_str) {
@@ -882,7 +977,7 @@ fn render_msg(msg: &Msg, channel: &Vec<Msg>, width: u16, selected_id: &Option<u6
     let mut header_vec: Vec<Span> = vec![" ".into(), time.into(), format!("  {} ", msg.user).into()];
 
     let mut used_chars = header_vec[0].content.chars().count() + header_vec[1].content.chars().count();
-    let max_text_length = width as usize - 6;
+    let max_text_length = width as usize - 9;
 
     if let Some(reply_id) = msg.replying_to {
         // assign these message ids according to their timestamp so that you eliminate the possibilty of id collision
@@ -952,13 +1047,21 @@ fn render_msg(msg: &Msg, channel: &Vec<Msg>, width: u16, selected_id: &Option<u6
 }
 
 fn dbg_write<T: Debug>(val: T) {
-    let prev = fs::read_to_string("debug").unwrap();
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(DEBUG_PATH) {
+            Ok(v) => v,
+            Err(_) => return
+        };
+
     let new = format!(
         "[{:.3}] {val:#?}: {}\n", 
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64 / 1000.0,
         type_name::<T>()
     );
-    let _ = fs::write("debug", format!("{prev}{new}"));
+    let _ = file.write_all(new.as_bytes());
 }
 
 impl Widget for &mut App {
@@ -1081,26 +1184,7 @@ impl Widget for &mut App {
                     false => area
                 });
 
-                let width = message_area[1].width as usize - 8;
-
                 let channel_name = self.current_server.channels[self.selected_channel.unwrap()].clone();
-                let buf_length = self.new_message_bufs.get(&channel_name).unwrap().len();
-                let visible = match buf_length > width {
-                    true => self.new_message_bufs[&channel_name][(buf_length - width)..].to_string(),
-                    false => self.new_message_bufs[&channel_name].clone()
-                };
-
-                let new_message_line = match self.new_message_bufs[&channel_name].is_empty() {
-                    true => vec![
-                        Span::from("  >  ").dark_gray(), 
-                        match self.typing {true => "N".to_string().gray().on_cyan(), false => "N".to_string().dark_gray()}, 
-                        "ew Message...".to_string().dark_gray()],
-                    false => vec![
-                        Span::from("  >  ").dark_gray(), 
-                        visible.into(), 
-                        match self.typing {true => " ", false => ""}.to_string().on_cyan()
-                    ],
-                };
 
                 let mut channels = self.current_server.channels.iter()
                     .map(|c| Line::from(format!(" #{c} "))).collect::<Vec<Line>>();
@@ -1261,8 +1345,10 @@ impl Widget for &mut App {
                     }).right_aligned())
                 }
 
-                Paragraph::new(Line::from(new_message_line))
+                let (msgline, scroll) = self.new_message_bufs[&channel_name].draw(self.typing, Some("New message...".to_string()), message_area[1].width - 2);
+                Paragraph::new(msgline)
                     .block(msg_block)
+                    .scroll((0, scroll - 1))
                     .render(message_area[1], buf);
                                 
             }
@@ -1289,14 +1375,10 @@ impl Widget for &mut App {
                     .title(Line::from(" Hostname ").centered())
                     .title_bottom(keybinds.centered());
 
-                let text = vec![
-                    " ".into(), 
-                    self.editing_server.hostname.clone().into(), 
-                    " ".on_cyan()
-                ];
-
-                Paragraph::new(Line::from(text))
+                let (line, offset) = self.editing_server.draw(true, Some(String::new()), vertical[1].width - 2);
+                Paragraph::new(line)
                     .block(block)
+                    .scroll((0, offset))
                     .render(vertical[1], buf);
 
             },
@@ -1333,38 +1415,18 @@ impl Widget for &mut App {
                     Constraint::Min(1)
                 ]).split(center[1]);
 
-                let focused = &self.selected_login_field;
-
-                let username = vec![
-                    " ".into(), 
-                    self.login.username.clone().into(), 
-                    if *focused == LoginField::Username {
-                        " ".on_cyan()
-                    } else {
-                        "".into()
-                    }
-                ];
-
-                let password = vec![
-                    " ".into(), 
-                    self.login.password.clone().chars().map(|_| "*").collect::<String>().into(), 
-                    if *focused == LoginField::Password {
-                        " ".on_cyan()
-                    } else {
-                        "".into()
-                    }
-                ];
+                let pwd_focused = self.selected_login_field == LoginField::Password;
                 
                 Paragraph::new(Line::from("Enter login credentials. Accounts that do not exist are automatically created.").centered())
                     .render(vertical[1], buf);
 
-                Paragraph::new(Line::from(username))
+                Paragraph::new(self.login.username.draw(!pwd_focused, Some(String::new()), 0).0)
                     .block(Block::bordered()
                         .border_set(border::DOUBLE)
                         .title(Line::from(" Username ")))
                     .render(vertical[2], buf);
 
-                Paragraph::new(Line::from(password))
+                Paragraph::new(self.login.password.draw_masked(pwd_focused))
                     .block(Block::bordered()
                         .border_set(border::DOUBLE)
                         .title(Line::from(" Password "))
@@ -1381,7 +1443,7 @@ async fn ping(domain: String) -> Option<u128> {
 
     return match connect_async(&addr).await {
         Ok((_, _)) => Some(start.elapsed().as_millis()),
-        Err(e) => None
+        Err(_) => None
     }
 }
 
@@ -1511,5 +1573,5 @@ async fn main () {
     std::process::exit(0);
 }
 
-// yes, this is a 1500 line rust file.
+// yes, this is a 1500+ line rust file.
 // what can i say? the vscode scope collapser is really nice.
