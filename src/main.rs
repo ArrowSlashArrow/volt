@@ -9,29 +9,33 @@ use std::{
         Duration, Instant, SystemTime, UNIX_EPOCH
     }
 };
-use futures_util::{stream::{SplitSink, SplitStream}, SinkExt, StreamExt};
+use futures_util::{stream::{SplitSink}, SinkExt, StreamExt};
 use futures::future::join_all;
-use tokio::net::TcpStream;
+
+use native_tls::TlsConnector;
+use rand::random_bool;
+use tokio::net::{tcp, TcpSocket, TcpStream};
 use tokio_tungstenite::{
-    connect_async, tungstenite::{
-        client::IntoClientRequest, http::{Response}, Error, Message
+    client_async, client_async_tls, connect_async, tungstenite::{
+        client::IntoClientRequest, connect, http::{Request, Response}, protocol::{frame::coding::CloseCode, CloseFrame, Role}, Error, Message
     }, MaybeTlsStream, WebSocketStream
 };
 
-use crossterm::{event::{self, Event, KeyCode, KeyEvent, KeyEventKind}};
+use crossterm::{event::{self, Event, KeyCode, KeyEvent, KeyEventKind}, terminal};
 use ratatui::{
     layout::{Constraint, Layout}, prelude::{
         Buffer, Rect
     }, style::{Color, Stylize}, symbols::border, text::{
         Line, Span, Text
     }, widgets::{
-        Block, Paragraph, Widget
+        Block, Paragraph, ScrollDirection, Widget
     }, DefaultTerminal, Frame
 };
 use sha2::{self, Digest, Sha256};
 use serde::{Deserialize, Serialize};
-use serde_json::{to_string, to_string_pretty, Value, from_value};
-use x25519_dalek::{EphemeralSecret, PublicKey};
+use serde_json::{from_str, from_value, to_string, to_string_pretty, Value};
+use url::Url;
+use x25519_dalek::{StaticSecret, PublicKey};
 use chrono::prelude::*;
 use copypasta::{ClipboardContext, ClipboardProvider};
 use unicode_segmentation::UnicodeSegmentation;
@@ -40,6 +44,8 @@ const CONFIG_PATH: &str = "./config.json";
 const PORT: u16 = 2096;
 const DARK_GRAY: Color = Color::Rgb(60, 60, 60);
 const DEBUG_PATH: &str = "./debug.log";
+
+mod commands;
 
 #[derive(Clone, Debug, Default)]
 pub struct Server {
@@ -61,10 +67,24 @@ enum LoginField {
     Password
 }
 
+enum ConnectedField {
+    Typing,
+    Channels
+}
+
 #[derive(Default, Clone)]
 struct Login {
     username: InputBuffer,
     password: InputBuffer,
+}
+
+impl Login {
+    fn new() -> Self {
+        Login {
+            username: InputBuffer::new(0),
+            password: InputBuffer::new(0)
+        }
+    }
 }
 
 impl Default for Screen {
@@ -73,20 +93,44 @@ impl Default for Screen {
     }
 }
 
+#[derive(Default, Debug, Clone)]  
+enum MsgType {
+    #[default]
+    Text,
+    Connect,
+    Disconnect
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct Msg {
     msg: String,
     id: u64,
     user: String,
     time: u64,
-    replying_to: Option<u64>
+    replying_to: Option<u64>,
+    _type: MsgType
+}
+
+impl Msg {
+    fn command_msg<T: Into<String>>(msg: T) -> Self {
+        let time = current_ms();
+        Msg {
+            msg: msg.into(),
+            id: time,
+            user: "Command service".into(),
+            time: time / 1000,
+            replying_to: None,
+            _type: MsgType::Text
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct CurrentServer {
     hostname: String,
     channels: Vec<String>,
-    msgs: HashMap<String, Vec<Msg>>
+    msgs: HashMap<String, Vec<Msg>>,
+    connected_users: Vec<String>
 }
 
 #[derive(Debug)]
@@ -102,16 +146,24 @@ pub struct PartialAppState {
 #[derive(Default, Clone)]
 pub struct InputBuffer {
     buf: String,
-    cursor_pos: usize
+    bufsize: usize,
+    cursor_pos: usize,
+    scroll_offset: usize
 }
 
 impl InputBuffer {
-    fn new() -> Self {
-        InputBuffer { buf: String::new(), cursor_pos: 0 }
+    fn new(bufsize: usize) -> Self {
+        InputBuffer { buf: String::new(), bufsize, cursor_pos: 0, scroll_offset: 0 }
     }
 
-    fn from(s: String) -> Self {
-        InputBuffer { buf: s.clone(), cursor_pos: s.len() }
+    fn from(s: String, bufsize: usize) -> Self {
+        InputBuffer { buf: s.clone(), bufsize, cursor_pos: s.len(), scroll_offset: s.len() }
+    }
+
+    fn clear(&mut self) {
+        self.buf = String::new();
+        self.cursor_pos = 0;
+        self.scroll_offset = 0;
     }
 
     fn add(&mut self, ch: char) {
@@ -120,7 +172,7 @@ impl InputBuffer {
         } else {
             self.buf.push(ch);
         }
-        self.cursor_pos += 1;
+        self.move_right();
     }
 
     fn backspace(&mut self) {
@@ -130,7 +182,7 @@ impl InputBuffer {
             } else {
                 self.buf.remove(self.cursor_pos - 1);
             }
-            self.cursor_pos -= 1;
+            self.move_left();
         }
     }
 
@@ -147,16 +199,25 @@ impl InputBuffer {
     fn move_left(&mut self) {
         if self.cursor_pos > 0 {
             self.cursor_pos -= 1;
+            if self.cursor_pos < self.scroll_offset {
+                self.scroll_offset -= 1;
+            }
         }
     }
 
     fn move_right(&mut self) {
         if self.cursor_pos < self.buf.len() {
             self.cursor_pos += 1;
+            if self.cursor_pos >= self.bufsize + self.scroll_offset {
+                self.scroll_offset += 1;
+            }
         }
     }
 
-    fn draw(&self, focused: bool, placeholder: Option<String>, bufsize: u16) -> (Line, u16) {
+    fn draw(&self, focused: bool, placeholder: Option<String>) -> (Line, u16) {
+        if self.bufsize < 1 {
+            return (Line::from(""), 0);
+        }
         let mut text: Vec<Span<'_>> = vec![" ".into()];
 
         match self.buf.clone().chars().count() > 0 {
@@ -181,12 +242,15 @@ impl InputBuffer {
             text[self.cursor_pos + 1] = text[self.cursor_pos + 1].clone().on_cyan().white();
         }
 
-        let scroll_uncapped = std::cmp::max(self.cursor_pos as i32 - bufsize as i32 / 2 + 3, 1);
-        (Line::from(text.clone()), std::cmp::min(scroll_uncapped, 65536) as u16)
+        (Line::from(text.clone()), std::cmp::min(self.scroll_offset, 65536) as u16)
         
     }
 
     fn draw_masked(&self, focused: bool) -> Line {
+        if self.bufsize < 1 {
+            return Line::from("");
+        }
+
         let mut text: Vec<Span<'_>> = vec![" ".into()];
         for _ in self.buf.clone().chars() {
             text.push(Span::from("*")); 
@@ -200,9 +264,18 @@ impl InputBuffer {
     }
 }
 
+enum ConnectState {
+    NotConnected,
+    LoggingIn,
+    Connected
+}
+
 pub struct App {
     screen: Screen,
+    connect_state: ConnectState,
     servers: Vec<Server>,
+    config: Config,
+    chars_matrix: Vec<Vec<bool>>,
     selected_server: usize,
     server_selection_scroll_size: u16,
     scroll_offset: i32,
@@ -213,16 +286,16 @@ pub struct App {
     status_text: String,
     terminal: Option<DefaultTerminal>,
     next_fn: Option<Box<dyn Fn(&mut Self)>>,
-    connected_socket_read: Option<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-    connected_socket_write: Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
+    socket_sender: Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
+    receiving_messages: bool,
     selected_login_field: LoginField,
     login: Login,
     session: String,
     current_user: String,
-    typing: bool,
+    selected_connected_field: ConnectedField,
     replying_to: Option<u64>,
     current_server: CurrentServer,
-    private: EphemeralSecret,
+    private: StaticSecret,
     public: PublicKey,
     clipboard: Box<dyn ClipboardProvider>,
     new_message_bufs: HashMap<String, InputBuffer>,
@@ -235,9 +308,11 @@ pub struct App {
     selected_msg_idcs: HashMap<String, Option<usize>> // index in the corresponding messages vec
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Config {
-    servers: Vec<String>
+    servers: Vec<String>,
+    random_local_addr: bool,
+    matrix_background: bool,
 }
 
 fn go_to_selection() -> Box<dyn Fn(&mut App)> {
@@ -259,8 +334,12 @@ fn payload<T: Into<String>>(action: T, data: HashMap<String, Value>) -> String {
     return to_string(&cloned).unwrap();
 }
 
-fn generate_keys() -> (EphemeralSecret, PublicKey) {
-    let private = EphemeralSecret::random();
+fn current_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+fn generate_keys() -> (StaticSecret, PublicKey) {
+    let private = StaticSecret::random();
     let public = PublicKey::from(&private);
     return (private, public)
 }
@@ -268,7 +347,7 @@ fn generate_keys() -> (EphemeralSecret, PublicKey) {
 // converts dict to msg object
 fn unpack_msg(raw_msg: &HashMap<String, String>) -> Msg {
     let get = |s: &str| {
-        raw_msg.get(s).unwrap().chars().filter(|c| *c != '"').collect::<String>()
+        raw_msg.get(s).unwrap_or(&"".to_string()).chars().filter(|c| *c != '"').collect::<String>()
     };
     return Msg { 
         msg: get("msg"), 
@@ -278,40 +357,70 @@ fn unpack_msg(raw_msg: &HashMap<String, String>) -> Msg {
         replying_to: match get("replying_to").parse::<u64>() {
             Ok(v) => Some(v),
             Err(_) => None
-        } 
+        },
+        _type: match get("type").as_str() {
+            "Connect" => MsgType::Connect,
+            "Disconnect" => MsgType::Disconnect,
+            _ => MsgType::Text
+        }
     }
+}
+
+fn new_row(chars: &mut Vec<Vec<bool>>, remove_last: bool) {
+    let mut new_row: Vec<bool> = vec![];
+    for i in 0..chars[0].len() {
+        new_row.push(match rand::random::<f64>() < 0.1 {
+            true => !chars.last().unwrap()[i],
+            false => chars.last().unwrap()[i]
+        });
+    };
+    chars.push(new_row);
+    if remove_last {
+        chars.remove(0);
+    }
+}
+
+fn new_col(chars: &mut Vec<Vec<bool>>) {
+    chars.iter_mut().for_each(|row| row.push(false));
 }
 
 fn pack_msg(msg: Msg) -> String {
     return format!(
-        "{{\"user\": \"{}\", \"time\": \"{}\", \"msg\": \"{}\", \"replying_to\": \"{}\"}}",
+        "{{\"user\": \"{}\", \"time\": \"{}\", \"msg\": \"{}\", \"replying_to\": \"{}\", \"type\": \"{:?}\"}}",
         msg.user,
         msg.time,
         msg.msg,
-        match msg.replying_to {Some(v) => v as i128, None => -1i128}
+        match msg.replying_to {Some(v) => v as i128, None => -1i128},
+        msg._type
     );
 }
-/*
 
- */
+
 impl App {
+    pub fn save_state(&mut self) -> Result<(), Error> {
+        // save config
+        let mut prevconfig = self.config.clone();
+        prevconfig.servers = self.servers.iter().map(|s| s.hostname.clone()).collect();
+
+        let json = to_string_pretty(&prevconfig).unwrap();
+        let mut file = File::create(CONFIG_PATH).unwrap();
+        file.write(json.as_bytes()).expect("Failed to write to file.");
+        Ok(())
+    }
     pub async fn run(&mut self, info_sender: Sender<PartialAppState>) -> io::Result<()> {
         while !self.exit {
-            let _ = info_sender.send(PartialAppState {
+            info_sender.send(PartialAppState {
                 servers: self.servers.clone(),
                 screen: self.screen.clone(),
             });
             self.redraw();
-            let _ = self.event_handler().await;
-            
+            if let Err(_) = self.event_handler().await {
+                self.save_state();
+                return Err(io::Error::new(io::ErrorKind::Other, "crash :("));
+            };
         }
-        // save config
-        let config = Config {
-            servers: self.servers.iter().map(|s| s.hostname.clone()).collect()
-        };
-        let json = to_string_pretty(&config)?;
-        let mut file = File::create(CONFIG_PATH)?;
-        file.write(json.as_bytes()).expect("Failed to write to file.");
+
+        self.save_state();
 
         Ok(())
     }
@@ -324,11 +433,11 @@ impl App {
     pub fn new_server(&mut self, editing: bool) {
         match editing {
             true => {
-                self.editing_server = InputBuffer::from(self.servers[self.selected_server].clone().hostname);
+                self.editing_server = InputBuffer::from(self.servers[self.selected_server].clone().hostname, 1);
                 self.editing_existing_index = Some(self.selected_server)
             },
             false => {
-                self.editing_server = InputBuffer::new();
+                self.editing_server = InputBuffer::new(1);
                 self.editing_existing_index = None
             }
         };
@@ -355,163 +464,112 @@ impl App {
     }
 
     pub fn go_to_selection(&mut self) {
-        self.connected_socket_read = None;
-        self.connected_socket_write = None;
+        self.socket_sender = None;
         self.selected_login_field = LoginField::Username;
-        self.login = Default::default();
+        self.login = Login::new();
         self.screen = Screen::Selection;
+        self.connect_state = ConnectState::NotConnected;
     }
 
     pub fn retry_login(&mut self) {
         self.selected_login_field = LoginField::Username;
-        self.login = Default::default();
+        self.login = Login::new();
         self.screen = Screen::Login;
     }
 
+    pub fn add_msg_to_current_channel(&mut self, msg: Msg) {
+        if let Some(idx) = self.selected_channel {
+            let selected_channel = self.current_server.channels[idx].clone();
+            self.current_server.msgs.get_mut(&selected_channel).unwrap().push(msg.clone());
+        }
+    }
+
+    pub async fn send_json(&mut self, payload: Value) {
+        let mut socket = self.socket_sender.take().unwrap();
+        socket.send(Message::Text(payload.to_string().into())).await.unwrap();
+        self.socket_sender = Some(socket);
+    }
+
+    pub fn get_socket(&mut self) -> TcpSocket {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(match self.config.random_local_addr {
+            // usually you aren't allowed to connect through the same ip
+            // this is used to spoof multiple clients from localhost because 127.0.0.1/8 are all local ips
+            true => format!("127.{}.{}.{}:0", rand::random::<u8>(), rand::random::<u8>(), rand::random::<u8>()),
+            false => "127.0.0.1:0".into()
+        }.parse().unwrap()).unwrap();
+        return socket;
+    }
+
     pub async fn connect(&mut self) {
-        // todo: make a WSS for tls (and e2ee eventually)
-        let url = format!("ws://{}:{PORT}", self.servers[self.selected_server].hostname).into_client_request().unwrap();
+        // todo: e2ee
         self.status("Connecting...");
-        let res: Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response<Option<Vec<u8>>>), Error> = connect_async(url).await;
-        match res {
-            Ok((ws_stream, response)) => {
-                let (mut write, mut read) = ws_stream.split();
+        
+        let url_str = format!("ws://{}:{PORT}", self.servers[self.selected_server].hostname);
+        let url = Url::parse(&url_str).unwrap();
 
-                if let Some(msg) = read.next().await {
-                    match msg {
-                        Ok(text) => {
-                            if text.to_string() == "already connected".to_string() {
-                                self.message("You are already connected to the server on this IP.", go_to_selection());
-                                return;
-                            } else {
-                                self.status(text.to_string());
-                            }
-                        },
-                        Err(_) => {
-                            self.message("Server threw an error.", go_to_selection());
-                            return;
-                        }
-                    }
-                };
+        let domain = url.host_str().unwrap();
+        let addr = url.socket_addrs(|| None).unwrap()[0];
 
-                self.status(
-                    format!("Connected to the server. ({})", response.status())
-                );
+        let tcp_stream;
 
-                let _ = write.send(payload("session", HashMap::new()).into()).await;
-                if let Some(msg) = read.next().await {
-                    match msg {
-                        Ok(v) => {
-                            self.connected_socket_read = Some(read);
-                            self.connected_socket_write = Some(write);
-                            let raw = v.into_text().unwrap().to_string();
-                            let json: Value = serde_json::from_str(&raw).unwrap();
-                            self.session = json["session"].as_str().unwrap().to_string();
-                            self.screen = Screen::Login;
-                        },
-                        Err(_) => {
-                            self.message("Unable to get session.", go_to_selection());
-                        }
-                    }
-                };
+        match self.get_socket().connect(addr).await {
+            Ok(v) => {
+                tcp_stream = v
             },
             Err(e) => {
                 self.message(
                     format!("Failed to connect to server\n{e}"),
                     go_to_selection()
-                )
+                );
+                return;
             }
         };
-    }
 
-    pub async fn handle_login(&mut self) {
-        let mut write = self.connected_socket_write.take();
-        let mut read = self.connected_socket_read.take();
-        if let Some(msg) = read.as_mut().unwrap().next().await {
-            match msg {
-                Ok(v) => match v {
-                    Message::Text(text) => {
-                        let json: Value = serde_json::from_str(&text.to_string()).unwrap();
-                        match json["success"].as_bool().unwrap() {
-                            true => {
-                                self.status("Logged in successfully. Fetching server data...");
-                            },
-                            false => {
-                                let reason = json["reason"].as_str().unwrap();
-                                self.message(format!("Login failed: {reason}"), retry_login());
-                                self.connected_socket_read = read;
-                                self.connected_socket_write = write;
-                                return;
-                            }
-                        }
-                    },
-                    _ => {}
-                }
-                
-                Err(_) => self.message("Failed to log in.", go_to_selection())
-            }
-        }
+        let connector = tokio_native_tls::TlsConnector::from(native_tls::TlsConnector::new().unwrap());
+        let tls_stream = connector.connect(&domain, tcp_stream).await.unwrap();
+        match client_async(url_str.into_client_request().unwrap(), MaybeTlsStream::NativeTls(tls_stream)).await {
+            Ok((stream, _response)) => {
+                let (mut write, mut read) = stream.split();
+                write.send(payload("session", HashMap::new()).into()).await;
+                self.socket_sender = Some(write);
 
-        self.screen = Screen::Connected;
+                self.status(
+                    format!("Connected to the server")
+                );
 
-        // fetch data
-        if let Err(_) = write.as_mut().unwrap().send(payload("data", self.session_template()).into()).await {
-            self.message("Connection timed out", go_to_selection());
-        };
+                // spawn sender thread
+                let sender = self.msg_sender.clone();
 
-        tokio::task::yield_now().await;
-        if let Some(raw) = read.as_mut().unwrap().next().await {
-            match raw {
-                Ok(data) => {
-                    self.selected_msg_idcs = HashMap::new();
-                    self.selected_msg_ids = HashMap::new();
-                    let json: Value = serde_json::from_str(data.to_string().as_str()).unwrap();
-                    let mut msgs: HashMap<String, Vec<Msg>> = HashMap::new();
-                    let channels: Vec<String> = from_value(json["channels"].clone()).unwrap();
-                    let raw_msg_lists: HashMap<String, Vec<String>> = from_value(json["msgs"].clone()).unwrap();
-                    for channel in channels.iter() {
-                        msgs.insert(
-                            channel.clone(),
-                            raw_msg_lists.get(channel).unwrap().iter()
-                                .map(|msg| {
-                                    let dict: Value = serde_json::from_str(msg.as_str()).unwrap();
-                                    let parsed = dict.as_object().unwrap().iter().map(|(k, v)| {
-                                        (k.clone(), v.to_string())
-                                    }).collect::<HashMap<String, String>>();
-                                    unpack_msg(&parsed)
-                                }).collect()
-                        );
-                        self.selected_msg_idcs.insert(channel.clone(), None);
-                        self.selected_msg_ids.insert(channel.clone(), None);
-                        self.new_message_bufs.insert(channel.clone(), InputBuffer::new());
-                    } 
- 
-                    if channels.len() > 0 {
-                        self.selected_channel = Some(0);
+                self.ws_reader_thread = Some(tokio::spawn(async move {
+                    while let Some(msg) = read.next().await {
+                        let _ = sender.send(msg).await;
                     }
-                    self.current_server = CurrentServer {hostname: format!("{}", self.servers[self.selected_server].hostname), channels, msgs};
-                },
-                Err(_) => {
-                    self.message("Failed to fetch server data", go_to_selection());
-                    return;
-                }
+                }));
+
+                self.connect_state = ConnectState::LoggingIn;
+            },
+            Err(e) => {
+                self.message(
+                    format!("Failed to connect to server\n{e}"),
+                    go_to_selection()
+                );
+                return;
             }
         };
-
-        // put it back
-        self.connected_socket_write = write;
-
-        let sender = self.msg_sender.clone();
-
-        // put it back and reread into thread var
-        self.connected_socket_read = read;
-        let mut thread_read = self.connected_socket_read.take().unwrap();
-        self.ws_reader_thread = Some(tokio::spawn(async move {
-            while let Some(msg) = thread_read.next().await {
-                let _ = sender.send(msg).await;
-            }
-        }));
     }
+
+    pub async fn disconnect(&mut self) {
+        let mut socket = self.socket_sender.take().unwrap();
+        let _ = socket.send(Message::Close(Some(CloseFrame{
+            code: CloseCode::Normal,
+            reason: self.current_server.channels[self.selected_channel.unwrap()].clone().into()
+        }))).await;
+        self.socket_sender = None;
+        self.ws_reader_thread.as_mut().unwrap().abort();
+        self.ws_reader_thread = None;
+        self.go_to_selection();
+    } 
 
     pub fn session_template(&mut self) -> HashMap<String, Value> {
         let mut template: HashMap<String, Value> = HashMap::new();
@@ -570,15 +628,6 @@ impl App {
         }
     }
 
-    pub async fn disconnect(&mut self) {
-        let mut socket = self.connected_socket_write.take().unwrap();
-        let _ = socket.send(Message::Close(None)).await;
-        self.connected_socket_write = None;
-        self.ws_reader_thread.as_mut().unwrap().abort();
-        self.ws_reader_thread = None;
-        self.go_to_selection();
-    } 
-
     pub async fn connected_keybinds(&mut self, key_event: KeyEvent) {
         let mut selected_channel: Option<String> = None;
         let channel_name = self.current_server.channels[self.selected_channel.unwrap()].clone();
@@ -586,6 +635,7 @@ impl App {
         if let Some(idx) = self.selected_channel {
             selected_channel = Some(self.current_server.channels[idx].clone());
         }
+
         let prev_msg = |app: &mut Self| {
             let idcs_array = app.selected_msg_idcs.clone();
             let selected_msg_idx = idcs_array.get(&selected_channel.clone().unwrap()).unwrap();
@@ -606,7 +656,7 @@ impl App {
             if let Some(id) = app.selected_msg_ids.get_mut(&selected_channel.clone().unwrap()) {
                 *id = Some(app.current_server.msgs[&selected_channel.clone().unwrap()][new_idx].id);
             };
-            app.typing = false;
+            app.selected_connected_field = ConnectedField::Channels;
         };
 
         let next_msg = |app: &mut Self| {
@@ -623,12 +673,13 @@ impl App {
                     }   
                 }
             };
-            app.typing = false;
+            app.selected_connected_field = ConnectedField::Channels;
         };
+
         let buf = self.new_message_bufs.get_mut(&channel_name).unwrap();
-        if self.typing {
-            match key_event.code {
-                KeyCode::Esc => self.typing = false,
+        match self.selected_connected_field {
+            ConnectedField::Typing => match key_event.code {
+                KeyCode::Esc => self.selected_connected_field = ConnectedField::Channels,
                 KeyCode::Char(c) => buf.add(c),
                 KeyCode::Backspace => buf.backspace(),
                 KeyCode::Delete => buf.delete(),
@@ -657,38 +708,46 @@ impl App {
                     }
                 },
                 KeyCode::Enter => {
-                    if let Some(_) = self.selected_channel {
-                        let sending = Msg {
-                            user: self.current_user.clone(),
-                            msg: self.new_message_bufs.get(&channel_name).unwrap().buf.clone(),
-                            id: 0,
-                            time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
-                            replying_to: self.replying_to
-                        };
-
-                        let mut data = self.session_template();
-                        data.insert("msg".to_string(), Value::from(pack_msg(sending)));
-                        data.insert("channel".to_string(), Value::from(channel_name.clone()));
-
-                        if let Some(ws) = self.connected_socket_write.as_mut() {
-                            ws.send(payload("message", data).into()).await.unwrap()
+                    let msgbuf = self.new_message_bufs.get(&channel_name).unwrap().buf.clone();
+                    if !msgbuf.is_empty() && let Some(_) = self.selected_channel {
+                        if msgbuf.starts_with("/") {
+                            commands::handle(msgbuf[1..].split(" ").collect(), self).await;
+                        } else {
+                            let sending = Msg {
+                                user: self.current_user.clone(),
+                                msg: msgbuf,
+                                id: 0,
+                                time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                                replying_to: self.replying_to,
+                                _type: MsgType::Text
+                            };
+        
+                            let mut data = self.session_template();
+                            data.insert("msg".to_string(), Value::from(pack_msg(sending)));
+                            data.insert("channel".to_string(), Value::from(channel_name.clone()));
+        
+                            if let Some(ws) = self.socket_sender.as_mut() {
+                                if let Err(e) = ws.send(payload("message", data).into()).await {
+                                    self.message(format!("Error sending message.\n{e}"), go_to_selection());
+                                }
+                            }
+        
+                            self.replying_to = None;
                         }
-
                         if let Some(msg) = self.new_message_bufs.get_mut(&channel_name) {
-                            *msg = InputBuffer::new();
+                            msg.clear();
                         }
                     }
                 },
                 KeyCode::Up => prev_msg( self),
                 KeyCode::Down => next_msg( self),
                 _ => {}
-            }
-        } else {
-            match key_event.code {
+            },
+            ConnectedField::Channels => match key_event.code {
                 KeyCode::Up => prev_msg(self),
                 KeyCode::Down => next_msg(self),
                 KeyCode::Esc => self.disconnect().await,
-                KeyCode::Tab => self.typing = true,
+                KeyCode::Tab => self.selected_connected_field = ConnectedField::Typing,
                 KeyCode::PageUp => {
                     if let Some(idx) = self.selected_channel.as_mut() {
                         if *idx > 0usize {
@@ -762,8 +821,9 @@ impl App {
                     }
                 }
                 _ => {}
-            }
-        }
+            },
+            _ => {}
+        };
     }
 
     pub fn new_keybinds(&mut self, key_event: KeyEvent) {
@@ -857,16 +917,15 @@ impl App {
                             Sha256::digest(self.login.password.buf.clone())[..].into()
                         );
 
-                        if let Some(socket) = self.connected_socket_write.as_mut() {
-                            let _ = socket.send(payload("login", data).into()).await;
-                        };
+                        self.receiving_messages = false;
                         self.status("Logging in...");
-                        if let (Some(read), Some(write)) = (self.connected_socket_read.take(), self.connected_socket_write.take()) {
-                            self.connected_socket_write = Some(write);
-                            self.connected_socket_read = Some(read);
-                            self.handle_login().await;
-                            self.current_user = self.login.username.buf.clone();
-                        }
+                        let mut sender = self.socket_sender.take().unwrap();
+                        let _ = sender.send(payload("login", data).into()).await;
+                        self.socket_sender = Some(sender);
+                        self.receiving_messages = true;
+
+                        
+                        self.current_user = self.login.username.buf.clone();
                     }
                 }
             },
@@ -890,43 +949,68 @@ impl App {
 
     pub async fn handle_ws_message(&mut self, message: Result<Message, Error>) {
         match message {
-            Ok(msg) => match msg {
-                Message::Text(m) => {
-                    let json_str = m.to_string();
+            Ok(msg) => {
+                match &msg {
+                    Message::Text(m) => {
+                        let json_str = m.to_string();
+                        let res = serde_json::from_str::<Value>(&json_str);
+                        if let Err(_) = res {
+                            return;
+                        }
 
-                    let mut new_msg: HashMap<String, String> = HashMap::new();
-                    match serde_json::from_str::<Value>(&json_str) {
-                        Ok(data) => {
-                            new_msg = data.as_object().unwrap().iter().map(|(k, v)| {
-                                let mut trimmed_v = v.to_string()[1..].to_string();
-                                trimmed_v.pop();
-                                (k.clone(), trimmed_v)
-                            }).collect();
-                        },
-                        Err(_) => return
-                    }
-                    
-                    match new_msg.get("what").unwrap_or(&"".to_string()).as_str() {
-                        "new_msg" => {
-                            let channel = new_msg.get("channel").unwrap();
-                            let raw_msg = new_msg.get("msg").unwrap().chars().filter(|c| *c != '\\').collect::<String>();
-                            let msg_dict: HashMap<String, Value> = serde_json::from_str(&raw_msg).unwrap();
-                            let msg = unpack_msg(
-                                &msg_dict.iter().map(|(k, v)| (k.clone(), v.to_string())).collect()
-                            );
+                        dbg_write(&res);
+                        let new_msg: HashMap<String, String> = res.unwrap().as_object().unwrap().iter().map(|(k, v)| {
+                            let mut trimmed_v = v.to_string()[1..].to_string();
+                            trimmed_v.pop();
+                            (k.clone(), trimmed_v)
+                        }).collect();
+                        dbg_write(&new_msg);
+                        match new_msg["what"].as_str() {
+                            "new_msg" => {
+                                let channel = new_msg.get("channel").unwrap();
+                                let raw_msg = new_msg.get("msg").unwrap().chars().filter(|c| *c != '\\').collect::<String>();
+                                dbg_write(&raw_msg);
+                                let msg_dict: HashMap<String, Value> = serde_json::from_str(&raw_msg).unwrap();
+                                let msg = unpack_msg(
+                                    &msg_dict.iter().map(|(k, v)| (k.clone(), v.to_string())).collect()
+                                );
 
-                            if let Some(channel) = self.current_server.msgs.get_mut(channel) {
-                                channel.push(msg)
-                            };                       
-                        },
-                        _ => {}
+                                if let Some(channel) = self.current_server.msgs.get_mut(channel) {
+                                    channel.push(msg.clone())
+                                };
+
+                                // handle disconnects
+                                match msg._type {
+                                    MsgType::Connect => {
+                                        self.current_server.connected_users.push(msg.user)
+                                    },
+                                    MsgType::Disconnect => {
+                                        self.current_server.connected_users.retain(|user| *user != msg.user);
+                                    },
+                                    _ => {}
+                                };
+                            },
+                            "newchannel" => {
+                                let channel_name = &new_msg["channel_name"];
+                                self.current_server.channels.push(channel_name.clone());
+                                self.current_server.msgs.insert(channel_name.clone(), vec![]);
+                                self.selected_msg_idcs.insert(channel_name.clone(), None);
+                                self.selected_msg_ids.insert(channel_name.clone(), None);
+                                self.new_message_bufs.insert(channel_name.clone(), InputBuffer::new(1));
+                            },
+                            "kickattempt" => {
+                                self.add_msg_to_current_channel(Msg::command_msg(new_msg["reason"].clone()));
+                            }
+                            _ => {}
+                        }
+                    },
+                    Message::Close(_) => {
+                        dbg_write("disconnecting");
+                        self.disconnect().await;
+                        self.message("The websocket has closed.", go_to_selection());
                     }
-                },
-                Message::Close(_) => {
-                    self.message("The websocket has closed.", go_to_selection());
-                    self.disconnect().await;
-                }
-                _ => {}
+                    _ => {}
+                };
             },           
             Err(e) => match e {
                 Error::ConnectionClosed => self.message("The websocket has kicked you out.", go_to_selection()),
@@ -935,27 +1019,208 @@ impl App {
         }
     }   
 
+    pub fn parse_msg(&mut self, raw: &String) -> Msg {
+        let dict: Value = serde_json::from_str(raw.as_str()).unwrap();
+        match dict.as_object() {
+            Some(json) => {
+                let parsed = json.iter().map(|(k, v)| {
+                    (k.clone(), v.to_string())
+                }).collect::<HashMap<String, String>>();
+                return unpack_msg(&parsed);
+            },
+            None => {
+                return Msg {
+                    msg: "<Garbled message>".into(),
+                    id: 0,
+                    user: "???".into(),
+                    time: 0,
+                    replying_to: None,
+                    _type: MsgType::Text
+                }
+            }
+        }
+    }
+
+    pub async fn handle_auth_message(&mut self, message: Result<Message, Error>) {
+        match message {
+            Ok(msg) => match msg {
+                Message::Text(m) => {
+                    let json_str = m.to_string();
+                    let res = serde_json::from_str::<Value>(&json_str);
+                    if let Err(_) = res {
+                        return;
+                    }
+                    
+                    let json = res.unwrap();                  
+                    match json["what"].as_str().unwrap() {
+                        "connect" => {
+                            match json["success"].as_bool() {
+                                Some(val) => {
+                                    let reason = match json["reason"].as_str() {
+                                        Some(v) => v,
+                                        None => "Failed to connect to server."
+                                    };
+
+                                    if !val {
+                                        self.message(reason, go_to_selection());
+                                        return;
+                                    }
+
+                                    let mut sender = self.socket_sender.take().unwrap();
+                                    sender.send(payload("session", HashMap::new()).into()).await;
+                                    self.socket_sender = Some(sender);
+                                }
+                                None => {
+                                    self.message("Server threw an error.", go_to_selection());
+                                    return;
+                                }
+                            }
+                        }
+                        "session" => {
+                            // todo: use it
+                            let mut pubkey_payload: HashMap<String, Value> = HashMap::new();
+                            pubkey_payload.insert("key".into(), base64::encode(self.public.as_bytes()).into());
+                            
+                            match json["success"].as_bool().unwrap() {
+                                true => {
+                                    self.session = json["session"].as_str().unwrap().to_string();
+                                    self.screen = Screen::Login;
+                                },
+                                false => {
+                                    self.message(
+                                        format!("Unable to get session.\n{}", json["reason"]),
+                                        go_to_selection()
+                                    );
+                                }
+                            }
+                        }
+                        "login" => match json["success"].as_bool().unwrap() {
+                            true => {
+                                let mut sender = self.socket_sender.take().unwrap();
+                                self.status("Logged in successfully. Fetching server data...");
+                                if let Err(_) = sender.send(payload("data", self.session_template()).into()).await {
+                                    self.message("Connection timed out", go_to_selection());
+                                };
+                                self.socket_sender = Some(sender);
+                            },
+                            false => {
+                                let reason = json["reason"].clone();
+                                self.message(format!("Login failed: {reason}"), retry_login());
+                                return;
+                            }
+                        }
+                        "data" => {
+                            self.screen = Screen::Connected;
+                            self.connect_state = ConnectState::Connected;
+
+                            self.selected_msg_idcs = HashMap::new();
+                            self.selected_msg_ids = HashMap::new();
+
+                            let mut msgs: HashMap<String, Vec<Msg>> = HashMap::new();
+                            
+                            let channels: Vec<String> = from_value(json["channels"].clone()).unwrap();
+                            let users: Vec<String> = from_value(json["users"].clone()).unwrap();
+                            
+                            let received: Result<HashMap<String, Vec<String>>, serde_json::Error> = from_str(&json["msgs"].clone().to_string());
+                            if let Err(e) = received {
+                                self.message(format!("Failed to fetch server data ({e:?})"), go_to_selection());
+                                return;
+                            }
+
+                            let raw_msg_lists = received.unwrap();
+
+                            for channel in channels.iter() {
+                                msgs.insert(
+                                    channel.clone(),
+                                    raw_msg_lists.get(channel).unwrap().iter()
+                                        .map(|msg| self.parse_msg(msg)).collect()
+                                );
+                                self.selected_msg_idcs.insert(channel.clone(), None);
+                                self.selected_msg_ids.insert(channel.clone(), None);
+                                self.new_message_bufs.insert(channel.clone(), InputBuffer::new(1));
+                            } 
+        
+                            if channels.len() > 0 {
+                                self.selected_channel = Some(0);
+                            }
+                            self.current_server = CurrentServer {
+                                hostname: format!("{}", self.servers[self.selected_server].hostname), 
+                                channels, 
+                                msgs,
+                                connected_users: users
+                            };
+                        }
+                        _ => {}
+                    }
+                },
+                Message::Close(_) => {
+                    self.disconnect().await;
+                    self.message("The websocket has closed.", go_to_selection());
+                }
+                _ => {}
+            },           
+            Err(e) => match e {
+                Error::ConnectionClosed => self.message(
+                    format!("Failed to connect to server\n{e}"),
+                    go_to_selection()
+                ),
+                _ => {}
+            }
+        }
+    }   
+
+    pub fn is_typing(&self) -> bool {
+        match self.selected_connected_field {
+            ConnectedField::Typing => true,
+            _ => false
+        }
+    }
+
     pub async fn event_handler(&mut self) -> io::Result<()> {
         if event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key_event) = event::read()? && key_event.kind == KeyEventKind::Press {
-                match self.screen {
-                    Screen::Selection => self.selection_keybinds(key_event).await,
-                    Screen::Connected => self.connected_keybinds(key_event).await,
-                    Screen::New       => self.new_keybinds(key_event),
-                    Screen::Status    => self.status_keybinds(key_event),
-                    Screen::Message   => self.message_keybinds(key_event),
-                    Screen::Login     => self.login_keybinds(key_event).await
-                };
+            match event::read()? {
+                Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                    match self.screen {
+                        Screen::Selection => self.selection_keybinds(key_event).await,
+                        Screen::Connected => self.connected_keybinds(key_event).await,
+                        Screen::New       => self.new_keybinds(key_event),
+                        Screen::Status    => self.status_keybinds(key_event),
+                        Screen::Message   => self.message_keybinds(key_event),
+                        Screen::Login     => self.login_keybinds(key_event).await
+                    };
+                },
+                Event::Resize(newcols, newrows) => {
+                    if self.chars_matrix[0].len() < (newcols / 2) as usize {
+                        let diff = (newcols / 2) as usize - self.chars_matrix[0].len(); 
+                        for _ in 0..diff {
+                            new_col(&mut self.chars_matrix);
+                        };
+                    }
+                    if self.chars_matrix.len() < newrows as usize {
+                        for _ in 0..newrows as usize - self.chars_matrix.len() {
+                            new_row(&mut self.chars_matrix, false);
+                        };
+                    }
+                }
+                _ => {}
             }
         };
-        match self.screen {
-            Screen::Connected => {
-                if let Ok(msg) = self.msg_receiver.try_recv() {
-                    self.handle_ws_message(msg).await;
+        if self.receiving_messages {
+            match self.connect_state {
+                ConnectState::Connected => {
+                    if let Ok(msg) = self.msg_receiver.try_recv() {
+                        self.handle_ws_message(msg).await;
+                    }
+                },
+                ConnectState::LoggingIn => {
+                    if let Ok(msg) = self.msg_receiver.try_recv() {
+                        self.handle_auth_message(msg).await;
+                    }
                 }
-            },
-            _ => {}
+                _ => {}
+            }
         }
+        
         Ok(())
     }
 }
@@ -974,7 +1239,11 @@ fn render_msg(msg: &Msg, channel: &Vec<Msg>, width: u16, selected_id: &Option<u6
         false => timestamp_str(msg.time).split(" ").collect::<Vec<&str>>()[1].to_string(),
         true => timestamp_str(msg.time)
     };
-    let mut header_vec: Vec<Span> = vec![" ".into(), time.into(), format!("  {} ", msg.user).into()];
+
+    if width < 10 { return vec![] }
+
+    // header
+    let mut header_vec: Vec<Span> = vec![" ".into(), format!("{time} ").into(), format!(" {} ", msg.user).into()];
 
     let mut used_chars = header_vec[0].content.chars().count() + header_vec[1].content.chars().count();
     let max_text_length = width as usize - 9;
@@ -985,7 +1254,7 @@ fn render_msg(msg: &Msg, channel: &Vec<Msg>, width: u16, selected_id: &Option<u6
         header_vec.push(match reply {
             Some(reply) => {
                 used_chars += 19 + reply.user.len();
-                let space_left = width as usize - used_chars;
+                let space_left = std::cmp::max(width as isize - used_chars as isize, 1) as usize;
                 let mut reply_content = reply.msg.clone();
                 if reply_content.len() >= space_left {
                     reply_content.truncate(space_left - 1);
@@ -997,53 +1266,67 @@ fn render_msg(msg: &Msg, channel: &Vec<Msg>, width: u16, selected_id: &Option<u6
         });
     }
 
-    let header = Line::from(header_vec);
-    let mut msg_lines = vec![header];
+    let mut msg_lines: Vec<Line> = vec![];
 
-    let array = msg.msg.split(' ').collect::<Vec<&str>>();
-    
-    let mut split_up: Vec<String> = vec![];
-    for word in array {
-        let mut new_val: Vec<String> = UnicodeSegmentation::graphemes(word, true)
-            .collect::<Vec<_>>()
-            .chunks(max_text_length)
-            .map(|chunk| chunk.concat())
-            .collect();
-        split_up.append(&mut new_val);
-    }
-    
-    let mut current_line = "".to_string();
-    let mut current_width = 0usize;
-    // greedy word wrapper
-    for word in split_up {
-        let word_width = word.chars().count();
+    match msg._type {
+        MsgType::Text => {
+            let array = msg.msg.split(' ').collect::<Vec<&str>>();
+            
+            let mut split_up: Vec<String> = vec![];
+            for word in array {
+                let mut new_val: Vec<String> = UnicodeSegmentation::graphemes(word, true)
+                    .collect::<Vec<_>>()
+                    .chunks(max_text_length)
+                    .map(|chunk| chunk.concat())
+                    .collect();
+                split_up.append(&mut new_val);
+            }
+            
+            let mut current_line = "".to_string();
+            let mut current_width = 0usize;
+            // greedy word wrapper
+            for word in split_up {
+                let word_width = word.chars().count();
 
-        if current_width + word_width + current_line.is_empty() as usize <= max_text_length {
+                if current_width + word_width + current_line.is_empty() as usize <= max_text_length {
+                    if !current_line.is_empty() {
+                        current_line.push(' ');
+                    }
+                    current_line += &word;
+                    current_width += word_width;
+                } else {
+                    if current_line.len() > max_text_length {
+                        current_line.truncate(max_text_length - 1);
+                        current_line.push('…')
+                    }
+                    msg_lines.push(format!("     {} ", current_line).into());
+                    current_line = word.to_string();
+                    current_width = word_width;
+                }
+            }
+
             if !current_line.is_empty() {
-                current_line.push(' ');
+                msg_lines.push(format!("     {} ", current_line).into());
             }
-            current_line += &word;
-            current_width += word_width;
-        } else {
-            if current_line.len() > max_text_length {
-                current_line.truncate(max_text_length - 1);
-                current_line.push('…')
-            }
-            msg_lines.push(format!("     {} ", current_line).into());
-            current_line = word.to_string();
-            current_width = word_width;
+        },
+        MsgType::Connect => {
+            header_vec.insert(2, " --> ".green());
+            header_vec.push("connected".into());
+        },
+        MsgType::Disconnect => {
+            header_vec.insert(2, " <-- ".red());
+            header_vec.push("disconnected".into());
         }
     }
 
-    if !current_line.is_empty() {
-        msg_lines.push(format!("     {} ", current_line).into());
-    }
+    let mut all_lines = vec![Line::from(header_vec)];
+    all_lines.append(&mut msg_lines);
 
     if let Some(selected) = selected_id &&& msg.id == selected {
-        msg_lines = msg_lines.iter().map(|line| line.clone().bg(DARK_GRAY)).collect();
+        all_lines = all_lines.iter().map(|line| line.clone().bg(DARK_GRAY)).collect();
     }
 
-    return msg_lines
+    return all_lines
 }
 
 fn dbg_write<T: Debug>(val: T) {
@@ -1067,6 +1350,25 @@ fn dbg_write<T: Debug>(val: T) {
 impl Widget for &mut App {
     // here is the drawing logic
     fn render(self, area: Rect, buf: &mut Buffer) {
+
+        if self.config.matrix_background {
+            // render hacker waterfall
+            new_row(&mut self.chars_matrix, true);
+
+            let lines = Text::from(self.chars_matrix.iter().rev().map(|row| {
+                Line::from(row.iter()
+                    .map(|on| match *on {
+                        true => format!("{:x} ", rand::random::<u8>() / 16).green(),
+                        false => "  ".into()
+                    })
+                    .collect::<Vec<Span>>()
+                )
+            }).collect::<Vec<Line>>());
+
+            Paragraph::new(lines)
+                .render(area, buf);
+        }
+        
         let ping_times = {
             let readonly = self.fetcher_info.lock().unwrap();
             readonly.ping_times.clone()
@@ -1171,18 +1473,23 @@ impl Widget for &mut App {
             },
             Screen::Connected => {
                 let horizontal = Layout::horizontal(vec![
-                    Constraint::Percentage(25),
+                    Constraint::Percentage(match self.sidebar {true => 20, false => 0}),
+                    Constraint::Length(match self.sidebar {true => 1, false => 0}), // spacing
+                    Constraint::Min(1),
                     Constraint::Length(1), // spacing
-                    Constraint::Min(1)
+                    Constraint::Percentage(20),
                 ]).split(area);
 
                 let message_area = Layout::vertical(vec![
                     Constraint::Min(1),
                     Constraint::Length(3)
-                ]).split(match self.sidebar {
-                    true => horizontal[2],
-                    false => area
-                });
+                ]).split(horizontal[2]);
+
+                // set all the msgbuf sizes
+                let msgbuf_width = message_area[0].width as usize - 4;
+                for (_, buf) in self.new_message_bufs.iter_mut() {
+                    buf.bufsize = msgbuf_width;
+                }
 
                 let channel_name = self.current_server.channels[self.selected_channel.unwrap()].clone();
 
@@ -1241,7 +1548,7 @@ impl Widget for &mut App {
                 }
 
                 // keybinds
-                let keybinds = match self.typing {
+                let keybinds = match self.is_typing() {
                     true => vec![
                         vec!["Send message", "enter"],
                         vec!["Select message", "up/down"],
@@ -1267,7 +1574,8 @@ impl Widget for &mut App {
                             });
                             keybind_vec.push(vec!["Deselect message", "d"]);
 
-                            let replying_to = self.current_server.msgs[&selected_channel.clone().unwrap()].iter().find(|msg| msg.id == *id).unwrap().replying_to;
+                            let replying_to = self.current_server.msgs[&selected_channel.clone().unwrap()]
+                                .iter().find(|msg| msg.id == *id).unwrap().replying_to;
                             keybind_vec.push(vec!["Copy message", "c"]);
                             match replying_to {
                                 Some(_) => {
@@ -1345,11 +1653,24 @@ impl Widget for &mut App {
                     }).right_aligned())
                 }
 
-                let (msgline, scroll) = self.new_message_bufs[&channel_name].draw(self.typing, Some("New message...".to_string()), message_area[1].width - 2);
+                if message_area[1].width < 2 { return }
+
+                let (msgline, scroll) = self.new_message_bufs[&channel_name].draw(
+                    self.is_typing(), 
+                    Some("New message...".to_string()),
+                );
                 Paragraph::new(msgline)
                     .block(msg_block)
-                    .scroll((0, scroll - 1))
+                    .scroll((0, scroll))
                     .render(message_area[1], buf);
+
+                Paragraph::new(
+                    Text::from(self.current_server.connected_users.iter().map(|u| Line::from(format!(" {u}"))).collect::<Vec<Line>>())
+                )
+                    .block(Block::bordered()
+                        .border_set(border::DOUBLE)
+                        .title(Line::from(" Connected Users ").centered()))
+                    .render(horizontal[4], buf);
                                 
             }
             Screen::New => { 
@@ -1370,12 +1691,16 @@ impl Widget for &mut App {
                     Constraint::Min(1)
                 ]).split(center[1]);
 
+                // set sizes
+                let msgbuf_width = center[1].width as usize - 4;
+                self.editing_server.bufsize = msgbuf_width;
+
                 let block = Block::bordered()
                     .border_set(border::DOUBLE)
                     .title(Line::from(" Hostname ").centered())
                     .title_bottom(keybinds.centered());
 
-                let (line, offset) = self.editing_server.draw(true, Some(String::new()), vertical[1].width - 2);
+                let (line, offset) = self.editing_server.draw(true, Some(String::new()));
                 Paragraph::new(line)
                     .block(block)
                     .scroll((0, offset))
@@ -1415,15 +1740,23 @@ impl Widget for &mut App {
                     Constraint::Min(1)
                 ]).split(center[1]);
 
+                // set sizes
+                let msgbuf_width = center[1].width as usize - 4;
+                self.login.username.bufsize = msgbuf_width;
+                self.login.password.bufsize = msgbuf_width;
+
                 let pwd_focused = self.selected_login_field == LoginField::Password;
                 
                 Paragraph::new(Line::from("Enter login credentials. Accounts that do not exist are automatically created.").centered())
                     .render(vertical[1], buf);
+                
+                let username_line = self.login.username.draw(!pwd_focused, None);
 
-                Paragraph::new(self.login.username.draw(!pwd_focused, Some(String::new()), 0).0)
+                Paragraph::new(username_line.0)
                     .block(Block::bordered()
                         .border_set(border::DOUBLE)
                         .title(Line::from(" Username ")))
+                    .scroll((0, username_line.1))
                     .render(vertical[2], buf);
 
                 Paragraph::new(self.login.password.draw_masked(pwd_focused))
@@ -1438,12 +1771,18 @@ impl Widget for &mut App {
 }
 
 async fn ping(domain: String) -> Option<u128> {
-    let addr = format!("ws://{domain}:{PORT}");
+    let addr = format!("wss://{domain}:{PORT}");
     let start = Instant::now();
 
     return match connect_async(&addr).await {
-        Ok((_, _)) => Some(start.elapsed().as_millis()),
-        Err(_) => None
+        Ok((mut write, _)) => {
+            let latency = Some(start.elapsed().as_millis());
+            let _ = write.send(Message::Close(None)).await;
+            latency
+        },
+        Err(_) => {
+            None
+        }
     }
 }
 
@@ -1465,11 +1804,20 @@ async fn main () {
         }
     };
 
-    let servers: Vec<Server> = config.servers
-        .into_iter()
-        .map(|s| Server {hostname: s})
-        .collect();
+    let (width, height) = terminal::size().unwrap();
+    let mut matrix: Vec<Vec<bool>> = vec![vec![]];
+    for _ in 0..width {
+        matrix[0].push(random_bool(0.5));
+    }
 
+    for _ in 1..height {
+        new_row(&mut matrix, false);
+    }
+
+    let servers: Vec<Server> = config.servers
+        .iter()
+        .map(|s| Server {hostname: s.clone()})
+        .collect();
 
     let ping_times_raw: Vec<Option<u128>> = vec![None; servers.len()];
     let fetcher_info_raw = FetcherInfo {
@@ -1487,7 +1835,10 @@ async fn main () {
     let terminal = ratatui::init();
     let mut app = App {
         screen: Default::default(),
+        connect_state: ConnectState::NotConnected,
         servers: Default::default(),
+        config: config,
+        chars_matrix: matrix,
         selected_server: Default::default(),
         server_selection_scroll_size: Default::default(),
         scroll_offset: Default::default(),
@@ -1499,12 +1850,12 @@ async fn main () {
         next_fn: Some(nop()),
         terminal: Some(terminal),
         clipboard: Box::new(clipboard),
-        connected_socket_read: Default::default(),
-        connected_socket_write: Default::default(),
+        socket_sender: Default::default(),
+        receiving_messages: true,
         selected_login_field: LoginField::Username,
         login: Default::default(),
         session: Default::default(),
-        typing: false,
+        selected_connected_field: ConnectedField::Channels,
         replying_to: None,
         current_server: Default::default(),
         current_user: String::new(),
@@ -1524,49 +1875,49 @@ async fn main () {
     // channel stuff
     let (ping_sender, ping_receiver): (Sender<PartialAppState>, Receiver<PartialAppState>) = mpsc::channel();
 
-    tokio::spawn(async move {
-        let mut hosts: Vec<Server> = vec![];
-        let mut screen: Screen = Screen::Selection;
-        // get the latencies of each server           
-        let mut ping_results = vec![];
-        loop {
-            
-            // get new data
-            while let Ok(state) = ping_receiver.try_recv() {
-                hosts = state.servers;
-                screen = state.screen;
-            }
-
-            
-            match screen {
-                Screen::Selection => {
-                    let ping_threads = hosts.clone()
-                        .into_iter()
-                        .map(|host| {
-                            tokio::spawn(async move {
-                                ping(host.hostname).await
+    {
+        tokio::spawn(async move {
+            let mut hosts: Vec<Server> = vec![];
+            let mut screen: Screen = Screen::Selection;
+            // get the latencies of each server           
+            let mut ping_results = vec![];
+            loop {
+                
+                // get new data
+                while let Ok(state) = ping_receiver.try_recv() {
+                    hosts = state.servers;
+                    screen = state.screen;
+                }
+                
+                match screen {
+                    Screen::Selection => {
+                        let ping_threads = hosts.clone()
+                            .into_iter()
+                            .map(|host| {
+                                tokio::spawn(async move {
+                                    ping(host.hostname).await
+                                })
                             })
-                        })
-                        .collect::<Vec<tokio::task::JoinHandle<Option<u128>>>>();
+                            .collect::<Vec<tokio::task::JoinHandle<Option<u128>>>>();
 
-                    ping_results = join_all(ping_threads).await.into_iter().map(
-                        |future| future.unwrap()
-                    ).collect();
-                }
-                _ => {}
-            };
+                        ping_results = join_all(ping_threads).await.into_iter().map(
+                            |future| future.unwrap_or(None)
+                        ).collect();
+                    }
+                    _ => {}
+                };
 
-            {
-                let mut info = thread_fetcher_info.lock().unwrap();
-                *info = FetcherInfo {
-                    ping_times: ping_results.clone()
+                {
+                    let mut info = thread_fetcher_info.lock().unwrap();
+                    *info = FetcherInfo {
+                        ping_times: ping_results.clone()
+                    }
                 }
-                // todo: ping the server (and maek the backend)
+
+                thread::sleep(Duration::from_millis(500))
             }
-
-            thread::sleep(Duration::from_millis(500))
-        }
-    });
+        });
+    }
 
     let _ = app.run(ping_sender).await;
     ratatui::restore(); 
