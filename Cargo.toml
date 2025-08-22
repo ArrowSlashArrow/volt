@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.22.1"
+bytes = "1.10.1"
 chrono = "0.4.41"
 copypasta = "0.10.2"
 crossterm = "0.29.0"
@@ -23,5 +24,11 @@ tokio = { version = "1.46.1", features = ["full"] }
 tokio-native-tls = "0.3.1"
 tokio-tungstenite = { version = "0.27.0", features = ["native-tls"] }
 unicode-segmentation = "1.12.0"
-url = "2.5.4"
 x25519-dalek = { version = "2.0.1", features = ["getrandom", "static_secrets"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+debug = false

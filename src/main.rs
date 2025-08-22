@@ -14,10 +14,10 @@ use futures::future::join_all;
 
 use native_tls::TlsConnector;
 use rand::random_bool;
-use tokio::net::{tcp, TcpSocket, TcpStream};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio_tungstenite::{
-    client_async, client_async_tls, connect_async, tungstenite::{
-        client::IntoClientRequest, connect, http::{Request, Response}, protocol::{frame::coding::CloseCode, CloseFrame, Role}, Error, Message
+    client_async, connect_async, connect_async_tls_with_config, tungstenite::{
+        protocol::{frame::coding::CloseCode, CloseFrame}, Error, Message
     }, MaybeTlsStream, WebSocketStream
 };
 
@@ -28,13 +28,12 @@ use ratatui::{
     }, style::{Color, Stylize}, symbols::border, text::{
         Line, Span, Text
     }, widgets::{
-        Block, Paragraph, ScrollDirection, Widget
+        Block, Paragraph, Widget
     }, DefaultTerminal, Frame
 };
 use sha2::{self, Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, from_value, to_string, to_string_pretty, Value};
-use url::Url;
 use x25519_dalek::{StaticSecret, PublicKey};
 use chrono::prelude::*;
 use copypasta::{ClipboardContext, ClipboardProvider};
@@ -263,7 +262,6 @@ impl InputBuffer {
         Line::from(text)
     }
 }
-
 enum ConnectState {
     NotConnected,
     LoggingIn,
@@ -300,8 +298,8 @@ pub struct App {
     clipboard: Box<dyn ClipboardProvider>,
     new_message_bufs: HashMap<String, InputBuffer>,
     sidebar: bool,
-    msg_receiver: tokio::sync::mpsc::Receiver<Result<Message, Error>>,
-    msg_sender: tokio::sync::mpsc::Sender<Result<Message, Error>>,
+    msg_receiver: tokio::sync::mpsc::UnboundedReceiver<Result<Message, Error>>,
+    msg_sender: tokio::sync::mpsc::UnboundedSender<Result<Message, Error>>,
     ws_reader_thread: Option<tokio::task::JoinHandle<()>>,
     selected_channel: Option<usize>,
     selected_msg_ids: HashMap<String, Option<u64>>,
@@ -313,6 +311,8 @@ pub struct Config {
     servers: Vec<String>,
     random_local_addr: bool,
     matrix_background: bool,
+    ping_timeout: u64,
+    trust_self_signed_certs: bool
 }
 
 fn go_to_selection() -> Box<dyn Fn(&mut App)> {
@@ -412,15 +412,15 @@ impl App {
             info_sender.send(PartialAppState {
                 servers: self.servers.clone(),
                 screen: self.screen.clone(),
-            });
+            }).unwrap();
             self.redraw();
             if let Err(_) = self.event_handler().await {
-                self.save_state();
+                self.save_state().unwrap();
                 return Err(io::Error::new(io::ErrorKind::Other, "crash :("));
             };
         }
 
-        self.save_state();
+        self.save_state().unwrap();
 
         Ok(())
     }
@@ -505,46 +505,37 @@ impl App {
         // todo: e2ee
         self.status("Connecting...");
         
-        let url_str = format!("ws://{}:{PORT}", self.servers[self.selected_server].hostname);
-        let url = Url::parse(&url_str).unwrap();
+        let url_str = format!("wss://{}:{PORT}", self.servers[self.selected_server].hostname);
 
-        let domain = url.host_str().unwrap();
-        let addr = url.socket_addrs(|| None).unwrap()[0];
+        let connector = match self.config.trust_self_signed_certs{
+            true => Some(tokio_tungstenite::Connector::NativeTls(
+                TlsConnector::builder()
+                    .danger_accept_invalid_certs(true)
+                    .build()
+                    .unwrap()
+            )),
+            false => None
+        } ;
 
-        let tcp_stream;
 
-        match self.get_socket().connect(addr).await {
-            Ok(v) => {
-                tcp_stream = v
-            },
-            Err(e) => {
-                self.message(
-                    format!("Failed to connect to server\n{e}"),
-                    go_to_selection()
-                );
-                return;
-            }
-        };
-
-        let connector = tokio_native_tls::TlsConnector::from(native_tls::TlsConnector::new().unwrap());
-        let tls_stream = connector.connect(&domain, tcp_stream).await.unwrap();
-        match client_async(url_str.into_client_request().unwrap(), MaybeTlsStream::NativeTls(tls_stream)).await {
+        match connect_async_tls_with_config(url_str, None, false, connector).await {
             Ok((stream, _response)) => {
-                let (mut write, mut read) = stream.split();
-                write.send(payload("session", HashMap::new()).into()).await;
+                let (write, mut read) = stream.split();
+                // write.send(payload("session", HashMap::new()).into()).await;
                 self.socket_sender = Some(write);
 
-                self.status(
-                    format!("Connected to the server")
-                );
+                // self.status(format!("Connected to the server"));
 
                 // spawn sender thread
                 let sender = self.msg_sender.clone();
 
                 self.ws_reader_thread = Some(tokio::spawn(async move {
-                    while let Some(msg) = read.next().await {
-                        let _ = sender.send(msg).await;
-                    }
+                    while let Some(msg) = read.next().await { 
+                        dbg_write(&msg);
+                        let _ = sender.send(msg);
+                    };
+                    dbg_write("end of reader loop");
+                    sender.send(Err(Error::ConnectionClosed)).unwrap();
                 }));
 
                 self.connect_state = ConnectState::LoggingIn;
@@ -559,11 +550,15 @@ impl App {
         };
     }
 
+    fn get_current_channel(&mut self) -> String {
+        self.current_server.channels.get(self.selected_channel.unwrap_or_default()).unwrap_or(&String::new()).clone()
+    }
+
     pub async fn disconnect(&mut self) {
         let mut socket = self.socket_sender.take().unwrap();
-        let _ = socket.send(Message::Close(Some(CloseFrame{
+        let _ = socket.send(Message::Close(Some(CloseFrame {
             code: CloseCode::Normal,
-            reason: self.current_server.channels[self.selected_channel.unwrap()].clone().into()
+            reason: self.get_current_channel().into()
         }))).await;
         self.socket_sender = None;
         self.ws_reader_thread.as_mut().unwrap().abort();
@@ -821,8 +816,7 @@ impl App {
                     }
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         };
     }
 
@@ -840,7 +834,11 @@ impl App {
                         servers[index] = Server { hostname: self.editing_server.buf.clone() };
                         {
                             let mut data = self.fetcher_info.lock().unwrap();
-                            data.ping_times[index] = None;
+                            if data.ping_times.len() == index {
+                                data.ping_times.push(None)
+                            } else {
+                                data.ping_times[index] = None;
+                            }
                         }
                     },
                     None => {
@@ -917,14 +915,12 @@ impl App {
                             Sha256::digest(self.login.password.buf.clone())[..].into()
                         );
 
-                        self.receiving_messages = false;
                         self.status("Logging in...");
+
                         let mut sender = self.socket_sender.take().unwrap();
                         let _ = sender.send(payload("login", data).into()).await;
                         self.socket_sender = Some(sender);
-                        self.receiving_messages = true;
 
-                        
                         self.current_user = self.login.username.buf.clone();
                     }
                 }
@@ -950,7 +946,8 @@ impl App {
     pub async fn handle_ws_message(&mut self, message: Result<Message, Error>) {
         match message {
             Ok(msg) => {
-                match &msg {
+                dbg_write(&msg);
+                match msg {
                     Message::Text(m) => {
                         let json_str = m.to_string();
                         let res = serde_json::from_str::<Value>(&json_str);
@@ -958,18 +955,17 @@ impl App {
                             return;
                         }
 
-                        dbg_write(&res);
                         let new_msg: HashMap<String, String> = res.unwrap().as_object().unwrap().iter().map(|(k, v)| {
                             let mut trimmed_v = v.to_string()[1..].to_string();
                             trimmed_v.pop();
                             (k.clone(), trimmed_v)
                         }).collect();
-                        dbg_write(&new_msg);
+
                         match new_msg["what"].as_str() {
                             "new_msg" => {
                                 let channel = new_msg.get("channel").unwrap();
                                 let raw_msg = new_msg.get("msg").unwrap().chars().filter(|c| *c != '\\').collect::<String>();
-                                dbg_write(&raw_msg);
+
                                 let msg_dict: HashMap<String, Value> = serde_json::from_str(&raw_msg).unwrap();
                                 let msg = unpack_msg(
                                     &msg_dict.iter().map(|(k, v)| (k.clone(), v.to_string())).collect()
@@ -1005,16 +1001,20 @@ impl App {
                         }
                     },
                     Message::Close(_) => {
-                        dbg_write("disconnecting");
+                        dbg_write("dihconnected");
                         self.disconnect().await;
                         self.message("The websocket has closed.", go_to_selection());
                     }
+                    Message::Ping(msg) => self.handle_ping(msg).await,
                     _ => {}
                 };
             },           
-            Err(e) => match e {
-                Error::ConnectionClosed => self.message("The websocket has kicked you out.", go_to_selection()),
-                _ => {}
+            Err(e) => {
+                dbg_write(&e);
+                match e {
+                    Error::ConnectionClosed => self.message("The websocket has kicked you out.", go_to_selection()),
+                    _ => {}
+                }
             }
         }
     }   
@@ -1041,6 +1041,19 @@ impl App {
         }
     }
 
+    async fn handle_ping(&mut self, msg: bytes::Bytes) {
+        dbg_write(format!("pinged"));
+        let mut ws = self.socket_sender.take().unwrap();
+
+        if let Err(e) = ws.send(Message::Pong(msg)).await {
+            self.message(
+                format!("Failed to reply with pong\n{e}"),
+                go_to_selection()
+            )
+        };
+        self.socket_sender = Some(ws);
+    }
+
     pub async fn handle_auth_message(&mut self, message: Result<Message, Error>) {
         match message {
             Ok(msg) => match msg {
@@ -1065,10 +1078,6 @@ impl App {
                                         self.message(reason, go_to_selection());
                                         return;
                                     }
-
-                                    let mut sender = self.socket_sender.take().unwrap();
-                                    sender.send(payload("session", HashMap::new()).into()).await;
-                                    self.socket_sender = Some(sender);
                                 }
                                 None => {
                                     self.message("Server threw an error.", go_to_selection());
@@ -1086,6 +1095,7 @@ impl App {
                                     self.session = json["session"].as_str().unwrap().to_string();
                                     self.screen = Screen::Login;
                                 },
+                                
                                 false => {
                                     self.message(
                                         format!("Unable to get session.\n{}", json["reason"]),
@@ -1094,7 +1104,8 @@ impl App {
                                 }
                             }
                         }
-                        "login" => match json["success"].as_bool().unwrap() {
+                        "login" => {
+                            match json["success"].as_bool().unwrap() {
                             true => {
                                 let mut sender = self.socket_sender.take().unwrap();
                                 self.status("Logged in successfully. Fetching server data...");
@@ -1108,7 +1119,7 @@ impl App {
                                 self.message(format!("Login failed: {reason}"), retry_login());
                                 return;
                             }
-                        }
+                        }}
                         "data" => {
                             self.screen = Screen::Connected;
                             self.connect_state = ConnectState::Connected;
@@ -1152,19 +1163,23 @@ impl App {
                         }
                         _ => {}
                     }
-                },
+                }
                 Message::Close(_) => {
                     self.disconnect().await;
                     self.message("The websocket has closed.", go_to_selection());
                 }
+                Message::Ping(msg) => self.handle_ping(msg).await,
                 _ => {}
             },           
-            Err(e) => match e {
-                Error::ConnectionClosed => self.message(
-                    format!("Failed to connect to server\n{e}"),
-                    go_to_selection()
-                ),
-                _ => {}
+            Err(e) => {
+                dbg_write(&e);
+                match e {
+                    Error::ConnectionClosed => self.message(
+                        format!("Failed to connect to server\n{e}"),
+                        go_to_selection()
+                    ),
+                    _ => {}
+                }
             }
         }
     }   
@@ -1283,7 +1298,7 @@ fn render_msg(msg: &Msg, channel: &Vec<Msg>, width: u16, selected_id: &Option<u6
             }
             
             let mut current_line = "".to_string();
-            let mut current_width = 0usize;
+            let mut current_width = 8usize;
             // greedy word wrapper
             for word in split_up {
                 let word_width = word.chars().count();
@@ -1295,7 +1310,7 @@ fn render_msg(msg: &Msg, channel: &Vec<Msg>, width: u16, selected_id: &Option<u6
                     current_line += &word;
                     current_width += word_width;
                 } else {
-                    if current_line.len() > max_text_length {
+                    if current_line.chars().count() > max_text_length {
                         current_line.truncate(max_text_length - 1);
                         current_line.push('…')
                     }
@@ -1340,8 +1355,8 @@ fn dbg_write<T: Debug>(val: T) {
         };
 
     let new = format!(
-        "[{:.3}] {val:#?}: {}\n", 
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64 / 1000.0,
+        "[{}] {val:#?}: {}\n", 
+        timestamp_str(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()),
         type_name::<T>()
     );
     let _ = file.write_all(new.as_bytes());
@@ -1829,7 +1844,7 @@ async fn main () {
     let (private, public) = generate_keys();
 
     // socket reader
-    let (ws_sender, ws_receiver) = tokio::sync::mpsc::channel::<Result<Message, Error>>(100);
+    let (ws_sender, ws_receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Message, Error>>();
 
     let clipboard = ClipboardContext::new().unwrap();
     let terminal = ratatui::init();
@@ -1914,7 +1929,7 @@ async fn main () {
                     }
                 }
 
-                thread::sleep(Duration::from_millis(500))
+                thread::sleep(Duration::from_millis(app.config.ping_timeout))
             }
         });
     }
