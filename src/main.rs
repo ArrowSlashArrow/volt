@@ -262,6 +262,8 @@ impl InputBuffer {
         Line::from(text)
     }
 }
+
+#[derive(Debug, Clone)]
 enum ConnectState {
     NotConnected,
     LoggingIn,
@@ -285,7 +287,6 @@ pub struct App {
     terminal: Option<DefaultTerminal>,
     next_fn: Option<Box<dyn Fn(&mut Self)>>,
     socket_sender: Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
-    receiving_messages: bool,
     selected_login_field: LoginField,
     login: Login,
     session: String,
@@ -521,10 +522,7 @@ impl App {
         match connect_async_tls_with_config(url_str, None, false, connector).await {
             Ok((stream, _response)) => {
                 let (write, mut read) = stream.split();
-                // write.send(payload("session", HashMap::new()).into()).await;
                 self.socket_sender = Some(write);
-
-                // self.status(format!("Connected to the server"));
 
                 // spawn sender thread
                 let sender = self.msg_sender.clone();
@@ -1220,22 +1218,22 @@ impl App {
                 _ => {}
             }
         };
-        if self.receiving_messages {
+
+        if let Ok(msg) = self.msg_receiver.try_recv() {
             match self.connect_state {
                 ConnectState::Connected => {
-                    if let Ok(msg) = self.msg_receiver.try_recv() {
-                        self.handle_ws_message(msg).await;
-                    }
+                    dbg_write("connected");
+                    self.handle_ws_message(msg).await;
                 },
                 ConnectState::LoggingIn => {
-                    if let Ok(msg) = self.msg_receiver.try_recv() {
-                        self.handle_auth_message(msg).await;
-                    }
-                }
+                    dbg_write("logging in");
+                    self.handle_auth_message(msg).await;
+                },
                 _ => {}
             }
         }
         
+            
         Ok(())
     }
 }
@@ -1866,7 +1864,6 @@ async fn main () {
         terminal: Some(terminal),
         clipboard: Box::new(clipboard),
         socket_sender: Default::default(),
-        receiving_messages: true,
         selected_login_field: LoginField::Username,
         login: Default::default(),
         session: Default::default(),
