@@ -506,22 +506,27 @@ impl App {
         // todo: e2ee
         self.status("Connecting...");
         
-        let url_str = format!("wss://{}:{PORT}", self.servers[self.selected_server].hostname);
+        let url_str = format!("ws://{}:{PORT}", self.servers[self.selected_server].hostname);
 
-        let connector = match self.config.trust_self_signed_certs{
-            true => Some(tokio_tungstenite::Connector::NativeTls(
-                TlsConnector::builder()
-                    .danger_accept_invalid_certs(true)
-                    .build()
-                    .unwrap()
-            )),
-            false => None
-        } ;
+        // if this custom connector is defined, we should use connect_async_tls_with_config
+        // this connector allows us to connect to self-signed certs (like wss on localhost)
+        // let connector = match self.config.trust_self_signed_certs{
+        //     true => Some(tokio_tungstenite::Connector::NativeTls(
+        //         TlsConnector::builder()
+        //             .danger_accept_invalid_certs(true)
+        //             .build()
+        //             .unwrap()
+        //     )),
+        //     false => None
+        // } ;
 
 
-        match connect_async_tls_with_config(url_str, None, false, connector).await {
+        match connect_async(url_str).await {
             Ok((stream, _response)) => {
-                let (write, mut read) = stream.split();
+                let (mut write, mut read) = stream.split();
+
+                // request session
+                write.send(payload("session", HashMap::new()).into()).await.unwrap();
                 self.socket_sender = Some(write);
 
                 // spawn sender thread
@@ -1784,7 +1789,7 @@ impl Widget for &mut App {
 }
 
 async fn ping(domain: String) -> Option<u128> {
-    let addr = format!("wss://{domain}:{PORT}");
+    let addr = format!("ws://{domain}:{PORT}");
     let start = Instant::now();
 
     return match connect_async(&addr).await {
